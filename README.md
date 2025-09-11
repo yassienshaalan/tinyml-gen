@@ -1,4 +1,4 @@
-# TinyML Modularized
+# Generative Compression of Channel Mixing for Separable CNNs on Microcontrollers
 
 This structure Reproducing the results for paper "Generative Compression of Channel Mixing for Separable CNNs on Microcontrollers":
 
