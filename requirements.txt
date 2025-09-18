@@ -1,6 +1,7 @@
+torch>=2.2
+torchaudio>=2.2
 numpy
-pandas
 scikit-learn
-torch
-transformers
-wfdb
+pandas
+tqdm
+pydrive2
