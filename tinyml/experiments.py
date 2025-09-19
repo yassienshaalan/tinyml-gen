@@ -19,7 +19,7 @@ def _dir_has_any(path):
 
 
 def _wfdb_download(db_name: str, dest: Path, do_download: bool, force: bool, verbose: bool):
-    if not do:
+    if not do_download:
         if verbose: print(f"[{name}] download disabled (do=False)")
         return
 
