@@ -5161,7 +5161,7 @@ except Exception:
     gcsfs = None
 
 RUN_TS = os.environ.get("RUN_TS") or datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-RESULTS_BASE_GCS = os.environ.get("TINYML_RESULTS_GCS")  # e.g., gs://my-bucket/tinyml/results
+RESULTS_BASE_GCS = "gs://store-pepper/tinyml_hyper_tiny_baselines/result" #os.environ.get("TINYML_RESULTS_GCS")  # e.g., 
 
 def _gcsfs_handle():
     if gcsfs is None:
