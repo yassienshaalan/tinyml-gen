@@ -5,7 +5,7 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-@_register_model
+
 class RegularCNN1D(nn.Module):
     def __init__(self, in_ch=1, num_classes=2, **kw):
         super().__init__()
@@ -18,7 +18,7 @@ class RegularCNN1D(nn.Module):
     def forward(self, x): return self.core(x)
 
 
-@_register_model
+
 class TinySep1D(nn.Module):
     def __init__(self, in_ch=1, num_classes=2, **kw):
         super().__init__()
@@ -28,7 +28,7 @@ class TinySep1D(nn.Module):
     def forward(self, x): return self.core(x)
 
 
-@_register_model
+
 class HypertinyHybrid(nn.Module):
     def __init__(self, dz=4, dh=12, in_ch=1, num_classes=2, base=16, latent_dim=16, input_length=1800, **kw):
         super().__init__()
@@ -46,7 +46,7 @@ class HypertinyHybrid(nn.Module):
     def forward(self, x): return self.core(x)
 
 
-@_register_model
+
 class HypertinyAllSynth(nn.Module):
     def __init__(self, dz=6, dh=16, in_ch=1, num_classes=2, base=16, latent_dim=16, input_length=1800, **kw):
         super().__init__()
@@ -62,7 +62,7 @@ class HypertinyAllSynth(nn.Module):
 
 # Minimal VAE encoder+head so TinyVAEHead exists if needed
 
-@_register_model
+
 class VAE1D_Enc(nn.Module):
     def __init__(self, in_ch=1, base=16, latent_dim=16, input_length=1800, **kw):
         super().__init__()
@@ -75,7 +75,7 @@ class VAE1D_Enc(nn.Module):
         return mu, logvar
 
 
-@_register_model
+
 class TinyVAEHead(nn.Module):
     """Simple VAE encoder + linear head so the name exists for both suites."""
     def __init__(self, in_ch=1, num_classes=2, z=16, base=16, input_length=1800, **kw):
@@ -90,7 +90,7 @@ class TinyVAEHead(nn.Module):
  #==================================Just Extra remove later
  #'''
 
-@_register_model
+
 class SafeFocalLoss(nn.Module):
     """
     Stable multi-class focal loss (supports hard labels or soft/one-hot).
@@ -126,7 +126,7 @@ class SafeFocalLoss(nn.Module):
             return focal.sum()
         return focal
 
-@_register_model
+
 class LabelSmoothingCrossEntropy(nn.Module):
     """Label smoothing for better generalization"""
     def __init__(self, smoothing=0.1):
@@ -143,7 +143,7 @@ class LabelSmoothingCrossEntropy(nn.Module):
         return loss.mean()
 
 
-@_register_model
+
 class FocalLoss(nn.Module):
     def __init__(self, gamma=1.5, alpha=None, reduction="mean"):
         super().__init__()
@@ -164,7 +164,7 @@ class FocalLoss(nn.Module):
         return loss.mean() if self.reduction == "mean" else loss.sum()
 
 
-@_register_model
+
 class SqueezeExcite1D(nn.Module):
     """Lightweight SE block for 1D signals - improves feature selection"""
     def __init__(self, channels, reduction=4):
@@ -182,7 +182,7 @@ class SqueezeExcite1D(nn.Module):
         return x * self.se(x)
 
 
-@_register_model
+
 class DepthwiseSeparable1D(nn.Module):
     def __init__(self, in_ch, out_ch, k=5, stride=1, padding=None, use_se=True, use_residual=True):
         super().__init__()
@@ -233,7 +233,7 @@ class DepthwiseSeparable1D(nn.Module):
 
 @torch.no_grad()
 
-@_register_model
+
 class SharedPWGenerator(nn.Module):
     """Enhanced latent-to-weight generator with better expressivity"""
     def __init__(self, z_dim=16, hidden=64):
@@ -262,7 +262,7 @@ class SharedPWGenerator(nn.Module):
         return h
 
 
-@_register_model
+
 class PWHead(nn.Module):
     """Enhanced projection with better weight generation"""
     def __init__(self, h_dim, flat_out):
@@ -282,7 +282,7 @@ class PWHead(nn.Module):
 
 # ==== Channel Split Safety Helper ====
 
-@_register_model
+
 class MultiScaleFeatures(nn.Module):
     """Extract features at multiple temporal scales"""
     def __init__(self, in_ch, out_ch):
@@ -308,7 +308,7 @@ class MultiScaleFeatures(nn.Module):
         return self.act(self.bn(features))
 
 
-@_register_model
+
 class SharedCoreSeparable1D(nn.Module):
     """
     Enhanced proposed model with:
@@ -434,7 +434,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-@_register_model
+
 class SafeFocalLoss(nn.Module):
     """
     Stable multi-class focal loss (supports hard labels or soft/one-hot).
@@ -471,7 +471,7 @@ class SafeFocalLoss(nn.Module):
         return focal
 
 
-@_register_model
+
 class TinyVAE1D(nn.Module):
     def __init__(self, in_channels=1, base=16, latent_dim=16, input_length=1800):
         super().__init__()
@@ -560,7 +560,7 @@ class TinyVAE1D(nn.Module):
         return xhat, mu, lv
 
 
-@_register_model
+
 class VAEAdapter(nn.Module):
     """Enhanced adapter with feature refinement"""
     def __init__(self, vae: TinyVAE1D):
@@ -579,7 +579,7 @@ class VAEAdapter(nn.Module):
         return refined + mu  # Residual connection
 
 
-@_register_model
+
 class AttentionPool1D(nn.Module):
     """
     Parameter-free temporal attention pooling.
@@ -591,7 +591,7 @@ class AttentionPool1D(nn.Module):
         return (x * alpha).sum(dim=-1)            # (B,C)
 
 
-@_register_model
+
 class TinyHead(nn.Module):
     def __init__(self, in_dim, num_classes=2, hidden=32):
         super().__init__()
@@ -613,7 +613,7 @@ class TinyHead(nn.Module):
         return self.net(z)
 
 
-@_register_model
+
 class SeparableBlock(nn.Module):
     def __init__(self, in_ch, out_ch, k=3, stride=1):
         super().__init__()
@@ -628,7 +628,7 @@ class SeparableBlock(nn.Module):
         return self.act(x)
 
 
-@_register_model
+
 class TinySeparableCNN(nn.Module):
     """Lightweight separable CNN for TinyML"""
     def __init__(self, in_ch, num_classes, base_filters=16, n_blocks=2):
@@ -651,7 +651,7 @@ class TinySeparableCNN(nn.Module):
         return self.fc(x)
 
 
-@_register_model
+
 class TinyVAEHead(nn.Module):
     """VAE encoder + linear head (no decoder for inference)"""
     def __init__(self, in_ch, num_classes, latent_dim=16, base_filters=16):
@@ -682,7 +682,7 @@ class TinyVAEHead(nn.Module):
         return self.head(z)
 
 
-@_register_model
+
 class TinyMethodModel(nn.Module):
     """Prototype of the method: synthesis MLP for channel mixing"""
     def __init__(self, in_ch, num_classes, base_filters=16, latent_dim=8):
@@ -721,7 +721,7 @@ class TinyMethodModel(nn.Module):
 
 # -------------------- Quick test runner ----------------
 
-@_register_model
+
 class SeparableBlock(nn.Module):
     def __init__(self, in_ch, out_ch, k=3, stride=1):
         super().__init__()
@@ -736,7 +736,7 @@ class SeparableBlock(nn.Module):
         return self.act(x)
 
 
-@_register_model
+
 class TinySeparableCNN(nn.Module):
     """Lightweight separable CNN for TinyML - baseline model"""
     def __init__(self, in_ch, num_classes, base_filters=16, n_blocks=2):
@@ -759,7 +759,7 @@ class TinySeparableCNN(nn.Module):
         return self.fc(x)
 
 
-@_register_model
+
 class TinyVAEHead(nn.Module):
     """VAE encoder + linear head (no decoder for inference) - feature-forward baseline"""
     def __init__(self, in_ch, num_classes, latent_dim=16, base_filters=16):
@@ -790,7 +790,7 @@ class TinyVAEHead(nn.Module):
         return self.head(z)
 
 
-@_register_model
+
 class TinyMethodModel(nn.Module):
     """The Method: Generative compression with synthesis MLP for channel mixing"""
     def __init__(self, in_ch, num_classes, base_filters=16, latent_dim=8):
@@ -826,7 +826,7 @@ class TinyMethodModel(nn.Module):
         x = self.pool(x).squeeze(-1)
         return self.fc(x)
 
-@_register_model
+
 class RegularCNN(nn.Module):
     """A regular CNN without TinyML constraints for comparison"""
     def __init__(self, input_length=1800, num_classes=2):
@@ -882,7 +882,7 @@ class RegularCNN(nn.Module):
         return x
 
 
-@_register_model
+
 class HRVFeatNet(nn.Module):
     """
     Computes a fixed 16D HRV(+amp) feature vector per window and learns a tiny linear head.
@@ -918,7 +918,7 @@ class HRVFeatNet(nn.Module):
 # B) Compact 1D-CNN baseline
 # ---------------------------
 
-@_register_model
+
 class ConvBlock(nn.Module):
     def __init__(self, c_in, c_out, k=7, s=1, p=None, pool=2):
         super().__init__()
@@ -934,7 +934,7 @@ class ConvBlock(nn.Module):
         return x
 
 
-@_register_model
+
 class CNN1D_3Blocks(nn.Module):
     def __init__(self, in_ch=1, num_classes=2, base=16):
         super().__init__()
@@ -954,7 +954,7 @@ class CNN1D_3Blocks(nn.Module):
 # C) Tiny 1D-ResNet baseline
 # ---------------------------
 
-@_register_model
+
 class BasicBlock1D(nn.Module):
     def __init__(self, c_in, c_out, stride=1, k=7):
         super().__init__()
@@ -978,7 +978,7 @@ class BasicBlock1D(nn.Module):
         return out
 
 
-@_register_model
+
 class ResNet1DSmall(nn.Module):
     """
     Stages: [base, 2*base, 2*base] with strides [2,2,2], 2 blocks per stage.
