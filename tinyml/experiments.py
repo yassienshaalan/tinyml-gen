@@ -32,9 +32,10 @@ def _wfdb_download(db_name: str, dest: Path, do_download: bool, force: bool, ver
     wfdb.dl_database(db_name, dest.as_posix())
     if verbose: print("  - Download completed.")
 
-APNEA_ROOT = Path("/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data/apnea-ecg-database-1.0.0")
-PTBXL_ROOT = Path("/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data/ptbxl")
-MITDB_ROOT = Path("/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data/mitbih/raw") #UCI HAR Dataset")
+DATA_BASE = os.environ.get("TINYML_DATA_ROOT","gs://store-pepper/tinyml_hyper_tiny_baselines/data") #"/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data")
+APNEA_ROOT = os.environ.get("APNEA_ROOT", f"{DATA_BASE}/apnea-ecg-database-1.0.0")
+PTBXL_ROOT = os.environ.get("PTBXL_ROOT", f"{DATA_BASE}/ptbxl")
+MITDB_ROOT = os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih/raw")
 
 for p in [APNEA_ROOT, PTBXL_ROOT, MITDB_ROOT]:
     p.mkdir(parents=True, exist_ok=True)
