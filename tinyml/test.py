@@ -27,3 +27,16 @@ for p in hea_files[:200]:
 
 if ok == 0:
     print("No complete .hea/.dat/.apn triplets found; wrong path or files not collocated.")
+
+
+import os
+from data_loaders import _list_trainable_records, load_apnea_ecg_loaders_impl
+
+os.environ["APNEA_ROOT"] = "gs://store-pepper/tinyml_hyper_tiny_baselines/data/apnea-ecg-database-1.0.0"
+root = os.environ["APNEA_ROOT"]
+
+recs = _list_trainable_records(root)
+print("Apnea usable records:", len(recs), recs[:10])
+dl_tr, dl_va, dl_te = load_apnea_ecg_loaders_impl(root, batch_size=8, length=1800, stride=None, verbose=True)
+print("batches:", len(dl_tr), len(dl_va), len(dl_te))
+

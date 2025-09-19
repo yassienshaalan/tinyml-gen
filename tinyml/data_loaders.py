@@ -1,4 +1,4 @@
-
+# data_loaders.py  — GCS-aware, recursive record discovery, WFDB local cache
 import math, os, json, random
 from pathlib import Path
 from typing import Tuple, List, Optional, Union
@@ -37,11 +37,18 @@ def _gcs_join(*parts: str) -> str:
     return out
 
 def _gcs_ls(prefix: str) -> List[str]:
+    """Shallow list (non-recursive)."""
     fs = _gcsfs()
     try:
         return fs.ls(prefix)
-    except FileNotFoundError:
+    except Exception:
         return []
+
+def _gcs_find(prefix: str) -> List[str]:
+    """Recursive list."""
+    fs = _gcsfs()
+    try:
+        return fs.find(prefix.rstrip("/"))
     except Exception:
         return []
 
@@ -61,6 +68,10 @@ def _gcs_get_file(src: str, dst: Path):
     with fs.open(src, "rb") as fsrc, open(dst, "wb") as fdst:
         fdst.write(fsrc.read())
 
+def _sanitize_cache_key(gcs_dir: str) -> str:
+    # Flatten gs://bucket/path -> bucket_path for a stable local cache dir
+    return gcs_dir.replace("gs://", "").replace("/", "_")
+
 def _ensure_local_record(gcs_dir: str, rid: str, exts: List[str]) -> Path:
     """
     Ensure local copies of WFDB record files (e.g., .hea/.dat/.apn) for record 'rid' under gcs_dir.
@@ -68,7 +79,7 @@ def _ensure_local_record(gcs_dir: str, rid: str, exts: List[str]) -> Path:
     """
     if not _is_gcs_path(gcs_dir):
         return Path(gcs_dir)
-    local_dir = DATA_GCS_CACHE / Path(gcs_dir.replace("gs://", "")).as_posix().replace("/", "_") / rid
+    local_dir = DATA_GCS_CACHE / _sanitize_cache_key(gcs_dir) / rid
     for ext in exts:
         _gcs_get_file(_gcs_join(gcs_dir, f"{rid}.{ext}"), local_dir / f"{rid}.{ext}")
     return local_dir
@@ -86,10 +97,9 @@ def _record_base_paths(root: Union[str, Path], rid: str, needed_exts: List[str])
         return str(Path(root) / rid)
 
 # =============================
-# Config
+# Config (env-overridable)
 # =============================
-# Data roots can be either local or gs://; defaults can be overridden via env vars.
-DATA_BASE = os.environ.get("TINYML_DATA_ROOT","gs://store-pepper/tinyml_hyper_tiny_baselines/data") #"/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data")
+DATA_BASE = os.environ.get("TINYML_DATA_ROOT", "gs://store-pepper/tinyml_hyper_tiny_baselines/data")
 APNEA_ROOT = os.environ.get("APNEA_ROOT", f"{DATA_BASE}/apnea-ecg-database-1.0.0")
 PTBXL_ROOT = os.environ.get("PTBXL_ROOT", f"{DATA_BASE}/ptbxl")
 MITDB_ROOT = os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih/raw")
@@ -99,37 +109,35 @@ FS = 100  # Apnea-ECG sampling rate
 # =============================
 # Apnea-ECG (GCS-aware)
 # =============================
-def _list_trainable_records(root: Union[str, Path]):
+def _list_trainable_records(root: Union[str, Path]) -> List[str]:
     """
     Use only learning-set records that truly have .apn: a**, b**, c**.
     Exclude x** (no labels) and *er variants.
-    Require .dat, .hea, .apn to exist.
+    Require .dat, .hea, .apn to exist (same folder).
+    Search recursively on GCS and locally.
     """
     root = str(root)
-    recs = []
+    recs = set()
     if _is_gcs_path(root):
-        for f in _gcs_ls(root):
-            p = Path(f)
-            if p.suffix == ".hea":
-                rid = p.stem
-                if not rid.startswith(("a", "b", "c")):  # drop x**
-                    continue
-                if rid.endswith("er"):
-                    continue
-                dat_ok = _gcs_exists(_gcs_join(root, f"{rid}.dat"))
-                apn_ok = _gcs_exists(_gcs_join(root, f"{rid}.apn"))
-                if dat_ok and apn_ok:
-                    recs.append(rid)
+        for f in _gcs_find(root):  # recursive (handles nested layouts)
+            if not f.endswith(".hea"):
+                continue
+            rid = Path(f).stem
+            if not rid.startswith(("a", "b", "c")) or rid.endswith("er"):
+                continue
+            parent = f.rsplit("/", 1)[0]
+            dat_ok = _gcs_exists(f"{parent}/{rid}.dat")
+            apn_ok = _gcs_exists(f"{parent}/{rid}.apn")
+            if dat_ok and apn_ok:
+                recs.add(rid)
     else:
-        for hea in Path(root).glob("*.hea"):
+        for hea in Path(root).rglob("*.hea"):
             rid = hea.stem
-            if not rid.startswith(("a","b","c")):
+            if not rid.startswith(("a","b","c")) or rid.endswith("er"):
                 continue
-            if rid.endswith("er"):
-                continue
-            if (Path(root)/f"{rid}.dat").exists() and (Path(root)/f"{rid}.apn").exists():
-                recs.append(rid)
-    return sorted(set(recs))
+            if hea.with_suffix(".dat").exists() and hea.with_suffix(".apn").exists():
+                recs.add(rid)
+    return sorted(recs)
 
 def _minute_labels_rdann(root: Union[str, Path], rid: str):
     base = _record_base_paths(root, rid, needed_exts=["apn", "hea", "dat"])
@@ -144,33 +152,22 @@ def _load_signal(root: Union[str, Path], rid: str) -> np.ndarray:
         try:
             names = fields.get('sig_name', None)
             if names and isinstance(names, (list, tuple)):
-                match_idx = None
                 for i, nm in enumerate(names):
                     if str(nm).lower() == 'ecg' or 'ecg' in str(nm).lower():
-                        match_idx = i
-                        break
-                if match_idx is not None:
-                    idx = match_idx
+                        idx = i; break
         except Exception:
             pass
         sig_arr = sig[:, idx] if sig.ndim > 1 else sig
         return sig_arr.astype(np.float32)
     except Exception:
         rec = wfdb.rdrecord(base)
-        if rec.p_signal is not None:
-            sig = rec.p_signal
-        else:
-            sig = rec.d_signal.astype(np.float32)
+        sig = rec.p_signal if rec.p_signal is not None else rec.d_signal.astype(np.float32)
         idx = 0
         try:
             if hasattr(rec, 'sig_name') and rec.sig_name:
-                match_idx = None
                 for i, nm in enumerate(rec.sig_name):
                     if str(nm).lower() == 'ecg' or 'ecg' in str(nm).lower():
-                        match_idx = i
-                        break
-                if match_idx is not None:
-                    idx = match_idx
+                        idx = i; break
         except Exception:
             pass
         sig_arr = sig[:, idx] if sig.ndim > 1 else sig
@@ -179,10 +176,8 @@ def _load_signal(root: Union[str, Path], rid: str) -> np.ndarray:
 def _sanitize_and_standardize_window(x: np.ndarray, clip_val: float = 10.0) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32, order="C")
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-    m = float(x.mean())
-    v = float(x.var())
-    if not np.isfinite(m):
-        m = 0.0
+    m = float(x.mean()); v = float(x.var())
+    if not np.isfinite(m): m = 0.0
     if (not np.isfinite(v)) or (v < 1e-4):
         x = x - m
     else:
@@ -243,43 +238,42 @@ class ApneaECGWindows(Dataset):
         return self._sig_cache[rid]
 
     def __getitem__(self, i: int):
-      rid, m, off = self.index[i]
-      sig  = self._sig(rid)
-      labs = self._labs[rid]
+        rid, m, off = self.index[i]
+        sig  = self._sig(rid)
+        labs = self._labs[rid]
 
-      start = m*FS*60 + off
-      end   = start + self.length
+        start = m*FS*60 + off
+        end   = start + self.length
 
-      if start >= len(sig):
-          chunk = np.zeros((self.length,), dtype=np.float32)
-      else:
-          if end > len(sig):
-              pad = end - len(sig)
-              chunk = np.pad(sig[start:], (0, pad), mode="constant", constant_values=0.0)
-          else:
-              chunk = sig[start:end]
+        if start >= len(sig):
+            chunk = np.zeros((self.length,), dtype=np.float32)
+        else:
+            if end > len(sig):
+                pad = end - len(sig)
+                chunk = np.pad(sig[start:], (0, pad), mode="constant", constant_values=0.0)
+            else:
+                chunk = sig[start:end]
 
-      if getattr(self, "normalize", None) == "per_window":
-          chunk = _sanitize_and_standardize_window(chunk)
-      else:
-          chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
+        if getattr(self, "normalize", None) == "per_window":
+            chunk = _sanitize_and_standardize_window(chunk)
+        else:
+            chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
 
-      raw_y = labs[m]
-      if isinstance(raw_y, (str, bytes)):
-          y = 1 if (raw_y == 'A' or raw_y == b'A' or raw_y == '1' or raw_y == b'1') else 0
-      else:
-          try:
-              yi = int(raw_y)
-              y = 1 if yi == 1 else 0
-          except Exception:
-              y = 0
+        raw_y = labs[m]
+        if isinstance(raw_y, (str, bytes)):
+            y = 1 if (raw_y in ('A', b'A', '1', b'1')) else 0
+        else:
+            try:
+                y = 1 if int(raw_y) == 1 else 0
+            except Exception:
+                y = 0
 
-      if not np.isfinite(chunk).all():
-          chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(chunk).all():
+            chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
 
-      x = torch.from_numpy(chunk.astype(np.float32)).unsqueeze(0)  # [1, T]
-      y = torch.tensor(y, dtype=torch.long)
-      return x, y
+        x = torch.from_numpy(chunk.astype(np.float32)).unsqueeze(0)  # [1, T]
+        y = torch.tensor(y, dtype=torch.long)
+        return x, y
 
 def _record_apnea_stats(root: Union[str, Path], records: list[str]):
     stats = []
@@ -294,7 +288,7 @@ def _record_apnea_stats(root: Union[str, Path], records: list[str]):
 def _records_from_index(ds):
     return sorted({rid for (rid, _, _) in ds.dataset.index})
 
-# These helpers must exist elsewhere in your project (unchanged):
+# NOTE: The following helpers are assumed to exist in your project:
 # _stratified_record_split_apnea, USE_WEIGHTED_SAMPLER, _make_weighted_sampler_apnea, _wif, print_class_distribution
 def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, verbose=True, seed=1337):
     root = root if isinstance(root, str) else str(root)
@@ -326,19 +320,19 @@ def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, v
     num_workers = 2 if torch.cuda.is_available() else 0
     if USE_WEIGHTED_SAMPLER:
         sampler = _make_weighted_sampler_apnea(ds_tr)
-        dl_tr = DataLoader(ds_tr, batch_size=batch_size, sampler=sampler, shuffle=False,num_workers=num_workers, drop_last=True, worker_init_fn=_wif)
+        dl_tr = DataLoader(ds_tr, batch_size=batch_size, sampler=sampler, shuffle=False, num_workers=num_workers, drop_last=True, worker_init_fn=_wif)
     else:
-        dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True,num_workers=num_workers, drop_last=True, worker_init_fn=_wif)
+        dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True, worker_init_fn=_wif)
     dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False, worker_init_fn=_wif)
     dl_te = DataLoader(ds_te, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False, worker_init_fn=_wif)
 
-    print("\\n=== ApneaECG Train class distribution (approx) ===")
+    print("\n=== ApneaECG Train class distribution (approx) ===")
     print_class_distribution(dl_tr, "ApneaECG Train")
     print("========================================")
-    print("\\n=== ApneaECG Val class distribution (approx) ===")
+    print("\n=== ApneaECG Val class distribution (approx) ===")
     print_class_distribution(dl_va, "ApneaECG Val")
     print("========================================")
-    print("\\n=== ApneaECG Test class distribution (approx) ===")
+    print("\n=== ApneaECG Test class distribution (approx) ===")
     print_class_distribution(dl_te, "ApneaECG Test")
     print("========================================")
 
@@ -361,11 +355,11 @@ AAMI_MAP = {
 def _read_signal_record(root: Union[str, Path], rec: str, prefer_lead_idx=0):
     base = _record_base_paths(root, rec, needed_exts=["hea", "dat"])
     record = wfdb.rdrecord(base)
-    X = np.asarray(record.p_signal, dtype=np.float32)  # (T, L)
+    X = np.asarray(record.p_signal, dtype=np.float32) if record.p_signal is not None else np.asarray(record.d_signal, dtype=np.float32)
     fs = int(record.fs)
-    L = X.shape[1]
-    idx = prefer_lead_idx if prefer_lead_idx < L else 0
-    x = X[:, idx]
+    L = X.shape[1] if X.ndim > 1 else 1
+    idx = prefer_lead_idx if (X.ndim > 1 and prefer_lead_idx < L) else 0
+    x = X[:, idx] if X.ndim > 1 else X
     return x, fs
 
 def _read_beats(root: Union[str, Path], rec: str):
@@ -422,15 +416,15 @@ class MITBIHBeats(Dataset):
 
 def _mitbih_records(root: Union[str, Path]) -> List[str]:
     root = str(root)
-    recs = []
+    recs = set()
     if _is_gcs_path(root):
-        for f in _gcs_ls(root):
+        for f in _gcs_find(root):   # recursive
             if f.endswith(".hea"):
-                recs.append(Path(f).stem)
+                recs.add(Path(f).stem)
     else:
-        for p in Path(root).glob("*.hea"):
-            recs.append(p.stem)
-    return sorted(set(recs))
+        for p in Path(root).rglob("*.hea"):
+            recs.add(p.stem)
+    return sorted(recs)
 
 def load_mitdb_loaders(root: Union[str, Path], batch_size=64, length=1800, binary=True):
     root = root if isinstance(root, str) else str(root)
@@ -483,6 +477,7 @@ def _ptbxl_paths(root: Union[str, Path]):
 def _wfdb_read_lead(base: Union[str, Path], prefer_lead="II") -> Tuple[np.ndarray, int]:
     base = str(base)
     if _is_gcs_path(base):
+        # base is a "records100/.../00001" style path under raw root (no extension)
         gp = Path(base.replace("gs://", ""))
         rid = gp.name
         gdir = "gs://" + str(gp.parent).strip("/")
@@ -495,13 +490,14 @@ def _wfdb_read_lead(base: Union[str, Path], prefer_lead="II") -> Tuple[np.ndarra
     fs = int(rec.fs)
     X = np.asarray(rec.p_signal, dtype=np.float32) if rec.p_signal is not None else np.asarray(rec.d_signal, dtype=np.float32)
     if isinstance(prefer_lead, int):
-        idx = prefer_lead if prefer_lead < X.shape[1] else 0
+        idx = prefer_lead if (X.ndim > 1 and prefer_lead < X.shape[1]) else 0
     else:
         idx = 0
         try:
             names = getattr(rec, 'sig_name', []) or []
+            up = str(prefer_lead).strip().upper()
             for i, nm in enumerate(names):
-                if str(nm).strip().upper() == str(prefer_lead).strip().upper():
+                if str(nm).strip().upper() == up:
                     idx = i; break
         except Exception:
             pass
