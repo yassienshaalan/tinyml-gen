@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from pathlib import Path
 def line(): print("-"*80)
 
+THRESH_GRID = np.linspace(0.05, 0.95, 19)
 
 def _dir_has_any(path):
     """Check if directory exists and has files"""
