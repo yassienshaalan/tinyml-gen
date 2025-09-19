@@ -1,13 +1,14 @@
 
 import argparse
 import logging
-import sys, os
+import sys, os, datetime
 from pathlib import Path
 from experiments import run_suite, available_datasets, ExpCfg
 
 LOG_PATH = Path(__file__).parent / "run.log"
 
 class GCSLogHandler(logging.Handler):
+    """Simple handler writing logs to a GS object (append)."""
     def __init__(self, gcs_uri: str):
         super().__init__()
         try:
@@ -20,7 +21,7 @@ class GCSLogHandler(logging.Handler):
         self.gcs_uri = gcs_uri
 
     def emit(self, record):
-        msg = self.format(record) + "\\n"
+        msg = self.format(record) + "\n"
         with self.fs.open(self.gcs_uri, "ab") as f:
             f.write(msg.encode("utf-8"))
 
@@ -38,8 +39,9 @@ def setup_logging():
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     logger.addHandler(fh)
 
+    # Optional GCS logging
     results_gcs = os.environ.get("TINYML_RESULTS_GCS")
-    run_ts = os.environ.get("RUN_TS") or __import__("datetime").datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    run_ts = os.environ.get("RUN_TS") or datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     if results_gcs:
         gcs_log = results_gcs.rstrip("/") + f"/logs/run_{run_ts}.log"
         try:
@@ -53,22 +55,19 @@ def setup_logging():
 
 def main():
     setup_logging()
-    parser = argparse.ArgumentParser(description="Run TinyML paper experiments")
+    parser = argparse.ArgumentParser(description="Run TinyML experiments (GCS-enabled)")
     parser.add_argument("--dataset", type=str, default="all",
-                        help="Which dataset to run: apnea_ecg, ptbxl, mitdb, or all")
+                        help="apnea_ecg, ptbxl, mitdb, or 'all'")
     parser.add_argument("--models", type=str, default="all",
-                        help="Comma-separated list of models (default: all registered)")
-    parser.add_argument("--epochs", type=int, default=8,
-                        help="Epochs for training (overrides ExpCfg)")
-    parser.add_argument("--batch_size", type=int, default=64,
-                        help="Batch size for loaders")
-    parser.add_argument("--input_len", type=int, default=1800,
-                        help="ECG window length for loaders")
+                        help="Comma-separated model keys (default: all registered)")
+    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--input_len", type=int, default=1800)
     args = parser.parse_args()
 
-    logging.info("Available datasets: %s", available_datasets())
+    logging.info("Datasets available: %s", available_datasets())
     from models import MODEL_BUILDERS
-    logging.info("Available models:   %s", list(MODEL_BUILDERS.keys()))
+    logging.info("Models available:   %s", list(MODEL_BUILDERS.keys()))
 
     datasets = available_datasets() if args.dataset == "all" else [args.dataset]
     if args.models == "all":
@@ -78,7 +77,6 @@ def main():
 
     cfg = ExpCfg(epochs=args.epochs, batch_size=args.batch_size, input_len=args.input_len)
     logging.info("Config: %s", cfg)
-
     run_suite(datasets=datasets, models=models, cfg=cfg)
 
 if __name__ == "__main__":
