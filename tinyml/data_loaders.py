@@ -89,7 +89,7 @@ def _record_base_paths(root: Union[str, Path], rid: str, needed_exts: List[str])
 # Config
 # =============================
 # Data roots can be either local or gs://; defaults can be overridden via env vars.
-DATA_BASE = os.environ.get("TINYML_DATA_ROOT", "/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data")
+DATA_BASE = os.environ.get("TINYML_DATA_ROOT","gs://store-pepper/tinyml_hyper_tiny_baselines/data") #"/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data")
 APNEA_ROOT = os.environ.get("APNEA_ROOT", f"{DATA_BASE}/apnea-ecg-database-1.0.0")
 PTBXL_ROOT = os.environ.get("PTBXL_ROOT", f"{DATA_BASE}/ptbxl")
 MITDB_ROOT = os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih/raw")
