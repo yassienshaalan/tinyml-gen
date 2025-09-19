@@ -19,6 +19,11 @@ def _dir_has_any(path):
 
 
 def _wfdb_download(db_name: str, dest: Path, do_download: bool, force: bool, verbose: bool):
+     if not do:
+        if verbose: print(f"[{name}] download disabled (do=False)")
+        return
+
+    dest = Path(dest)  # <— FIX: ensures mkdir exists
     dest.mkdir(parents=True, exist_ok=True)
     exists_any = _dir_has_any(dest)
     if verbose:
