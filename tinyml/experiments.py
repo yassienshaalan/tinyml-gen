@@ -20,8 +20,9 @@ def _dir_has_any(path):
 
 def _wfdb_download(db_name: str, dest: Path, do_download: bool, force: bool, verbose: bool):
     if not do_download:
-        if verbose: print(f"[{name}] download disabled (do=False)")
-        return
+	    if verbose: 
+			print(f"[{name}] download disabled (do=False)")
+			return
 
     dest = Path(dest)  
     dest.mkdir(parents=True, exist_ok=True)
@@ -35,7 +36,8 @@ def _wfdb_download(db_name: str, dest: Path, do_download: bool, force: bool, ver
         if verbose: print("  - Files present; not forcing re-download.")
         return
     wfdb.dl_database(db_name, dest.as_posix())
-    if verbose: print("  - Download completed.")
+    if verbose: 
+		print("  - Download completed.")
 
 DATA_BASE = os.environ.get("TINYML_DATA_ROOT","gs://store-pepper/tinyml_hyper_tiny_baselines/data") #"/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data")
 APNEA_ROOT = os.environ.get("APNEA_ROOT", f"{DATA_BASE}/apnea-ecg-database-1.0.0")
