@@ -10462,22 +10462,6 @@ for p in sorted(glob(str(exp_dir/'*.json'))):
         'boot_ms': round(boot_ms, 2) if isinstance(boot_ms, (int,float)) and not math.isnan(boot_ms) else np.nan,
     })
 
-df = pd.DataFrame(rows).sort_values(['dataset','model','exp']) if rows else pd.DataFrame(columns=[
-    'exp','dataset','model','packed_kb','val_f1@t','test_acc','test_macro_f1',
-    'acc_ci_lo','acc_ci_hi','f1_ci_lo','f1_ci_hi','t_star','lat_ms','boot_ms'
-])
-
-display(df)
-
-csv_path = exp_dir / 'summary.csv'
-df.to_csv(csv_path, index=False)
-try:
-    save_df_to_drive(df, "aggregate_summary.csv")
-except Exception:
-    pass
-print("Saved CSV:", csv_path)
-
-# Optional: compact LaTeX with flexible columns
 
 def df_to_latex_table(df, caption="TinyML Results (LEAN)", label="tab:tinyml_lean"):
     cols = [c for c in ['dataset','model','packed_kb','test_acc','acc_ci_lo','acc_ci_hi',
@@ -10490,25 +10474,6 @@ def df_to_latex_table(df, caption="TinyML Results (LEAN)", label="tab:tinyml_lea
         latex +
         f"\\caption{{{caption}}}\n\\label{{{label}}}\n\\end{table}\n"
     )
-
-summary_txt = exp_dir / 'summary.txt'
-with summary_txt.open('w') as f:
-    for _, r in df.iterrows():
-        f.write(f"{r['exp']} :: acc={r.get('test_acc', np.nan)}  macroF1={r.get('test_macro_f1', np.nan)}  "
-                f"t*={r.get('t_star', np.nan)}  kb={r.get('packed_kb', np.nan)}  "
-                f"lat={r.get('lat_ms', np.nan)}ms\n")
-print("Wrote text summary:", summary_txt)
-
-if skipped:
-    print(f"Skipped {len(skipped)} file(s):")
-    for p, why in skipped[:5]:
-        print("  -", p, "->", why)
-    if len(skipped) > 5:
-        print("  ...")
-
-if errors:
-    print(f"Found {len(errors)} error artifact(s) (not included).")
-
 
 from models import safe_build_model, MODEL_BUILDERS
 from data_loaders import (
