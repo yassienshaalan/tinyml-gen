@@ -11,7 +11,12 @@ from pathlib import Path
 import json, math
 from torch.utils.data import Sampler
 
-
+import os, json, datetime
+from pathlib import Path
+try:
+    import gcsfs
+except Exception:
+    gcsfs = None
 
 
 import os, random, numpy as np, wfdb, torch
@@ -5803,10 +5808,22 @@ def proxy_latency_estimate(model, T=2000, c_in=1, repeats=10):
 
 def already_done(name): return (EXP_DIR / f"{name}.json").exists()
 
-def save_json(name, payload):
-    p = EXP_DIR / f"{name}.json"
-    p.write_text(json.dumps(payload, indent=2))
-    return str(p)
+def save_json(name: str, payload: dict, local_dir: str|Path=None) -> str:
+    fname = f"{name}-{RUN_TS}.json"
+    if RESULTS_BASE_GCS:
+        fs = _gcsfs()
+        dst = _join(RESULTS_BASE_GCS, fname)
+        with fs.open(dst, "w") as f:
+            f.write(json.dumps(payload, indent=2))
+        print(f"[RESULTS] wrote {dst}")
+        return dst
+    # local fallback
+    outdir = Path(local_dir or (Path(__file__).parent / "results"))
+    outdir.mkdir(parents=True, exist_ok=True)
+    out = outdir / fname
+    out.write_text(json.dumps(payload, indent=2))
+    print(f"[RESULTS] wrote {out}")
+    return str(out)
 
 def print_and_log(name, payload):
     print(f"[RESULT] {name} → {json.dumps(payload, indent=2)[:800]}...")
@@ -10419,3 +10436,15 @@ def save_json(name, payload):
 def print_and_log(name, payload):
     print(f"[RESULT] {name} -> {json.dumps(payload, indent=2)[:800]}...")
     save_json(name, payload)
+
+	def _gcsfs():
+    if gcsfs is None:
+        raise ImportError("pip install gcsfs for GCS writing")
+    return gcsfs.GCSFileSystem(cache_timeout=60)
+
+def _join(root: str, *parts: str) -> str:
+    root = root.rstrip("/")
+    for p in parts:
+        root += "/" + str(p).lstrip("/")
+    return root
+	
