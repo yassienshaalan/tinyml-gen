@@ -1,83 +1,119 @@
+# main.py — compat wrapper that preserves your old flow but uses GCS-aware loaders
 
-import argparse
-import logging
-import sys, os, datetime
+import os, sys, logging
 from pathlib import Path
-from experiments import run_suite, available_datasets, ExpCfg
 
+# --- logging: screen + run.log next to main ---
 LOG_PATH = Path(__file__).parent / "run.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout),
+              logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")],
+)
+logging.info("Starting TinyML compat main")
 
-class GCSLogHandler(logging.Handler):
-    """Simple handler writing logs to a GS object (append)."""
-    def __init__(self, gcs_uri: str):
-        super().__init__()
-        try:
-            import gcsfs
-        except Exception:
-            gcsfs = None
-        if gcsfs is None:
-            raise ImportError("gcsfs is required for GCS logging. pip install gcsfs")
-        self.fs = gcsfs.GCSFileSystem(cache_timeout=60)
-        self.gcs_uri = gcs_uri
+# --- experiments: keep your original registry-driven runner ---
+from experiments import (
+    ExpCfg,
+    register_dataset,        # <-- must exist in experiments.py
+    available_datasets,
+    run_all_experiments,     # <-- your original entrypoint
+)
 
-    def emit(self, record):
-        msg = self.format(record) + "\n"
-        with self.fs.open(self.gcs_uri, "ab") as f:
-            f.write(msg.encode("utf-8"))
+# --- use the new GCS-aware loaders directly ---
+from data_loaders import (
+    APNEA_ROOT, PTBXL_ROOT, MITDB_ROOT,
+    load_apnea_ecg_loaders_impl as gcs_load_apnea,
+    load_ptbxl_loaders          as gcs_load_ptbxl,
+    load_mitdb_loaders          as gcs_load_mitdb,
+)
 
-def setup_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    for h in list(logger.handlers):
-        logger.removeHandler(h)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-    logger.addHandler(ch)
-    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-    logger.addHandler(fh)
-
-    # Optional GCS logging
-    results_gcs = os.environ.get("TINYML_RESULTS_GCS")
-    run_ts = os.environ.get("RUN_TS") or datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    if results_gcs:
-        gcs_log = results_gcs.rstrip("/") + f"/logs/run_{run_ts}.log"
-        try:
-            gh = GCSLogHandler(gcs_log)
-            gh.setLevel(logging.INFO)
-            gh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-            logger.addHandler(gh)
-            logger.info("GCS logging enabled -> %s", gcs_log)
-        except Exception as e:
-            logger.warning("Could not enable GCS logging: %s", e)
-
-def main():
-    setup_logging()
-    parser = argparse.ArgumentParser(description="Run TinyML experiments (GCS-enabled)")
-    parser.add_argument("--dataset", type=str, default="all",
-                        help="apnea_ecg, ptbxl, mitdb, or 'all'")
-    parser.add_argument("--models", type=str, default="all",
-                        help="Comma-separated model keys (default: all registered)")
-    parser.add_argument("--epochs", type=int, default=8)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--input_len", type=int, default=1800)
-    args = parser.parse_args()
-
-    logging.info("Datasets available: %s", available_datasets())
+# --- models: optional aliases + list available (if needed) ---
+try:
     from models import MODEL_BUILDERS
-    logging.info("Models available:   %s", list(MODEL_BUILDERS.keys()))
+    _MODEL_KEYS = list(MODEL_BUILDERS.keys())
+except Exception:
+    MODEL_BUILDERS, _MODEL_KEYS = {}, []
 
-    datasets = available_datasets() if args.dataset == "all" else [args.dataset]
-    if args.models == "all":
-        models = list(MODEL_BUILDERS.keys())
-    else:
-        models = [m.strip() for m in args.models.split(",") if m.strip()]
+MODEL_ALIASES = {
+    "regcnn":   "regular_cnn",
+    "tinysep":  "tiny_separable_cnn",
+    "hybrid":   "tiny_method",
+    "allsynth": "tiny_method",
+    # If your registry key is the class name, you can also alias to it:
+    # "tiny_method": "tinymethodmodel",
+}
 
-    cfg = ExpCfg(epochs=args.epochs, batch_size=args.batch_size, input_len=args.input_len)
-    logging.info("Config: %s", cfg)
-    run_suite(datasets=datasets, models=models, cfg=cfg)
+def _resolve_model_key(name: str) -> str:
+    k = name.lower().strip()
+    k = MODEL_ALIASES.get(k, k)
+    return "".join(ch for ch in k if ch.isalnum() or ch == "_")
 
-if __name__ == "__main__":
-    main()
+# -------------------- Dataset Registry (GCS) --------------------
+# We override the dataset handlers here so your run uses the new loaders.
+
+def _apnea_gcs_wrapper(batch_size=64, length=1800, stride=None, **_):
+    """Returns (tr, va, te, meta) to match your original registry contract."""
+    logging.info("[apnea_ecg] root=%s", APNEA_ROOT)
+    tr, va, te = gcs_load_apnea(APNEA_ROOT, batch_size=batch_size, length=length, stride=stride, verbose=True)
+    meta = {'num_channels': 1, 'seq_len': length, 'num_classes': 2, 'fs': 100}
+    return tr, va, te, meta
+
+def _ptbxl_gcs_wrapper(batch_size=64, length=1800, **_):
+    logging.info("[ptbxl] root=%s", PTBXL_ROOT)
+    tr, va, te, meta = gcs_load_ptbxl(PTBXL_ROOT, batch_size=batch_size, length=length)
+    if isinstance(meta, dict):
+        meta.setdefault('num_channels', 1)
+        meta.setdefault('seq_len', length)
+    return tr, va, te, meta
+
+def _mitdb_gcs_wrapper(batch_size=64, length=1800, binary=True, **_):
+    logging.info("[mitdb] root=%s", MITDB_ROOT)
+    tr, va, te, info = gcs_load_mitdb(MITDB_ROOT, batch_size=batch_size, length=length, binary=binary)
+    meta = {'num_channels': 1, 'seq_len': length, 'num_classes': 2, 'fs': info.get('fs', 360)}
+    return tr, va, te, meta
+
+# Register (overrides any earlier registration inside experiments.py)
+register_dataset('apnea_ecg', _apnea_gcs_wrapper)
+
+# Flip these to True if you want them in this run (kept False to match your old main)
+REGISTER_PTB = False
+REGISTER_MIT = False
+
+if REGISTER_PTB:
+    register_dataset('ptbxl', _ptbxl_gcs_wrapper)
+
+if REGISTER_MIT:
+    register_dataset('mitdb', _mitdb_gcs_wrapper)
+
+logging.info("[Registry] Available datasets: %s", available_datasets())
+
+# -------------------- Config (kept close to your old main) --------------------
+# NOTE: input_len=1800 matches your Apnea windows; adjust per dataset if needed.
+cfg = ExpCfg(
+    epochs=8, batch_size=64, lr=2e-3, device=('cuda' if os.environ.get('CUDA_VISIBLE_DEVICES') else 'cpu'),
+    limit=None, num_workers=0, target_fs=None, length=1800, window_ms=800, input_len=1800
+)
+
+# Seed (fallback if experiments doesn’t expose seed_everything)
+try:
+    from experiments import seed_everything
+except Exception:
+    import random, numpy as np, torch
+    def seed_everything(seed: int = 42):
+        random.seed(seed); np.random.seed(seed)
+        try:
+            torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        except Exception:
+            pass
+
+seed_everything(getattr(cfg, "seed", 42))
+
+# -------------------- Run (like your old main) --------------------
+# Start with apnea_ecg only, exactly like you had:
+df = run_all_experiments(cfg, datasets=['apnea_ecg'])
+print("Final thing")
+print(df)
