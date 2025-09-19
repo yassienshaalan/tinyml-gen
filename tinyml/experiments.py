@@ -18,7 +18,7 @@ try:
 except Exception:
     gcsfs = None
 
-from data_loaders import load_apnea_ecg_loaders_impl, APNEA_ROOT
+from data_loaders import load_apnea_ecg_loaders_impl, APNEA_ROOT as DL_APNEA_ROOT, _normalize_gs_uri
 
 import os, random, numpy as np, wfdb, torch
 from torch.utils.data import Dataset, DataLoader
@@ -41,6 +41,8 @@ FS = 100  # Apnea-ECG sampling rate
 THRESH_GRID = np.linspace(0.05, 0.95, 19)
 def line(): print("-"*80)
 
+
+	
 # --- Normalize different dataset returns to (tr, va, te, meta) ---
 def _normalize_dataset_return(ret):
     if isinstance(ret, (tuple, list)):
@@ -151,20 +153,18 @@ def _apnea_gcs_wrapper(**kwargs):
     batch_size = kwargs.get('batch_size', 64)
     length     = kwargs.get('length', 1800)
     stride     = kwargs.get('stride', None)
-    verbose    = True  # show what root we use
+
+    # Prefer env, fallback to data_loaders default; then normalize
+    root_env = os.environ.get("APNEA_ROOT", DL_APNEA_ROOT)
+    root = _normalize_gs_uri(root_env)
 
     print("In get_or_make_loaders_once")
     print("apnea_ecg", _apnea_gcs_wrapper)
-    print(f"[apnea_ecg] root={APNEA_ROOT}")
+    print(f"[apnea_ecg] root={root}")
 
     tr, va, te = load_apnea_ecg_loaders_impl(
-        APNEA_ROOT,
-        batch_size=batch_size,
-        length=length,
-        stride=stride,
-        verbose=verbose
+        root, batch_size=batch_size, length=length, stride=stride, verbose=True
     )
-
     meta = {'num_channels': 1, 'seq_len': length, 'num_classes': 2}
     return tr, va, te, meta
 	
@@ -5350,10 +5350,10 @@ def _wfdb_download(db_name: str, dest: Path, do_download: bool, force: bool, ver
     if verbose: 
 	    print("  - Download completed.")
 
-DATA_BASE = os.environ.get("TINYML_DATA_ROOT","gs://store-pepper/tinyml_hyper_tiny_baselines/data") #"/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data")
-APNEA_ROOT = os.environ.get("APNEA_ROOT", f"{DATA_BASE}/apnea-ecg-database-1.0.0")
-PTBXL_ROOT = os.environ.get("PTBXL_ROOT", f"{DATA_BASE}/ptbxl")
-MITDB_ROOT = os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih/raw")
+DATA_BASE = _normalize_gs_uri(os.environ.get("TINYML_DATA_ROOT", "gs://store-pepper/tinyml_hyper_tiny_baselines/data"))
+APNEA_ROOT = _normalize_gs_uri(os.environ.get("APNEA_ROOT", f"{DATA_BASE}/apnea-ecg-database-1.0.0"))
+PTBXL_ROOT = _normalize_gs_uri(os.environ.get("PTBXL_ROOT", f"{DATA_BASE}/ptbxl"))
+MITDB_ROOT = _normalize_gs_uri(os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih/raw"))
 
 for p in [APNEA_ROOT, PTBXL_ROOT, MITDB_ROOT]:
     Path(p).mkdir(parents=True, exist_ok=True)
@@ -10137,169 +10137,6 @@ def _wif(worker_id):
     s = getattr(cfg, "seed", 42) + worker_id
     np.random.seed(s)
     random.seed(s)
-print("Loaded all helper functions")
-
-
-#The main
-
-MODEL_ALIASES = {
-    "regcnn": "regular_cnn",
-    "tinysep": "tiny_separable_cnn",
-    "hybrid": "tiny_method",
-    "allsynth": "tiny_method",
-}
-# -------------------- Dataset Registry --------------------
-DATASET_REGISTRY = {}
-register_dataset('apnea_ecg', _apnea_gcs_wrapper)
-
-register_ptb = False
-if register_ptb:
-  # Register PTB-XL (if run_ptbxl exists)
-  try:
-      def _ptbxl_wrapper(**kwargs):
-          # Create a complete config object with ALL expected attributes
-          class CompleteCfg:
-              def __init__(self, **kw):
-                  # Set comprehensive defaults for ALL possible attributes
-                  # Dataset params
-                  self.target_fs = 100
-                  self.batch_size = 64
-                  self.val_split = 0.1
-                  self.limit = None
-                  self.num_workers = 2
-                  self.label_type = 'superclass'
-                  self.input_len = 1000
-                  self.use_focal_loss= True
-
-                  # Model architecture params
-                  self.base = 32  # base filters for models
-                  self.num_blocks = 3
-                  self.filter_length = 3
-                  self.dropout = 0.1
-                  self.activation = 'relu'
-
-                  # Training params
-                  self.epochs_cnn = 3
-                  self.epochs_vae_pre = 3
-                  self.epochs_head = 3
-                  self.lr = 1e-3
-                  self.weight_decay = 1e-4
-                  self.scheduler = 'cosine'
-                  self.warmup_epochs = 1
-
-                  # System params
-                  self.device = 'cpu'
-                  self.debug = True
-                  self.verbose = True
-                  self.seed = 42
-
-                  # Data augmentation params
-                  self.augment = False
-                  self.noise_std = 0.01
-                  self.time_warp = False
-                  self.latent_dim = 16
-
-                  # Override with provided kwargs
-                  for k, v in kw.items():
-                      setattr(self, k, v)
-
-          cfg = CompleteCfg(**kwargs)
-
-          result = run_ptbxl(cfg, str(PTBXL_ROOT))
-          if isinstance(result, dict) and 'dl_tr' in result:
-              return result['dl_tr'], result['dl_va'], result.get('dl_te'), result['meta']
-          else:
-              raise Exception(f"PTB-XL loader returned: {result}")
-
-      register_dataset('ptbxl', _ptbxl_wrapper)
-  except NameError:
-      if DO_MITDB_DOWNLOAD and _dir_has_any(MITDB_ROOT):
-          register_dataset('mitdb', _mitdb_wrapper)
-      else:
-          print("[Registry] MIT-BIH skipped - data not available or download disabled")
-      print("[Registry] PTB-XL loader not found - skip registration")
-register_mit = False
-if register_mit:
-  # Register MIT-BIH (if run_mitdb exists)
-  try:
-      def _mitdb_wrapper(**kwargs):
-          class CompleteCfg:
-              def __init__(self, **kw):
-                  # Set comprehensive defaults for ALL possible attributes
-                  # Dataset params
-                  self.fs = 360
-                  self.target_fs = 250
-                  self.window_ms = 800
-                  self.batch_size = 64
-                  self.val_split = 0.1
-                  self.limit = None
-                  self.num_workers = 2
-                  self.input_len = 800
-                  self.use_focal_loss= True
-
-                  # Model architecture params
-                  self.base = 32  # base filters for models
-                  self.num_blocks = 3
-                  self.filter_length = 3
-                  self.dropout = 0.1
-                  self.activation = 'relu'
-
-                  # Training params
-                  self.epochs_cnn = 3
-                  self.epochs_vae_pre = 3
-                  self.epochs_head = 3
-                  self.lr = 1e-3
-                  self.weight_decay = 1e-4
-                  self.scheduler = 'cosine'
-                  self.warmup_epochs = 1
-
-                  # System params
-                  self.device = 'cpu'
-                  self.debug = True
-                  self.verbose = True
-                  self.seed = 42
-
-                  # Data augmentation params
-                  self.augment = False
-                  self.noise_std = 0.01
-                  self.time_warp = False
-                  self.latent_dim = 16
-
-                  # Override with provided kwargs
-                  for k, v in kw.items():
-                      setattr(self, k, v)
-
-          cfg = CompleteCfg(**kwargs)
-
-          result = run_mitdb(cfg, str(MITDB_ROOT))
-          if isinstance(result, dict) and 'dl_tr' in result:
-              return result['dl_tr'], result['dl_va'], result.get('dl_te'), result['meta']
-          else:
-              # Only register if data exists
-              if DO_PTBXL_DOWNLOAD and _dir_has_any(PTBXL_ROOT):
-                  register_dataset('ptbxl', _ptbxl_wrapper)
-              else:
-                  print("[Registry] PTB-XL skipped - data not available or download disabled")
-              raise Exception(f"MIT-BIH loader returned: {result}")
-      register_dataset('mitdb', _mitdb_wrapper)
-  except NameError:
-      print("[Registry] MIT-BIH loader not found - skip registration")
-
-
-print("Dataset registry and sanity check system loaded!")
-
-print(f"[Registry] Available datasets: {available_datasets()}")
-
-# Single cfg for all (adjust if needed)
-cfg = ExpCfg(
-    epochs=8, batch_size=64, lr=2e-3, device='cpu',
-    limit=None, num_workers=0, target_fs=None, length=1800, window_ms=800, input_len=1000
-)
-seed_everything(getattr(cfg, "seed", 42))
-df = run_all_experiments(cfg, datasets=['apnea_ecg'])
-print("Final thing")
-print(df)
-
 
 
 from glob import glob
