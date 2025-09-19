@@ -18,7 +18,7 @@ try:
 except Exception:
     gcsfs = None
 
-from data_loaders import load_apnea_ecg_loaders_impl
+rom data_loaders import load_apnea_ecg_loaders_impl, APNEA_ROOT
 
 import os, random, numpy as np, wfdb, torch
 from torch.utils.data import Dataset, DataLoader
@@ -147,6 +147,27 @@ def _load_signal(root: Path, rid: str) -> np.ndarray:
         sig_arr = sig[:, idx] if sig.ndim > 1 else sig
         return sig_arr.astype(np.float32)
 
+def _apnea_gcs_wrapper(**kwargs):
+    batch_size = kwargs.get('batch_size', 64)
+    length     = kwargs.get('length', 1800)
+    stride     = kwargs.get('stride', None)
+    verbose    = True  # show what root we use
+
+    print("In get_or_make_loaders_once")
+    print("apnea_ecg", _apnea_gcs_wrapper)
+    print(f"[apnea_ecg] root={APNEA_ROOT}")
+
+    tr, va, te = load_apnea_ecg_loaders_impl(
+        APNEA_ROOT,
+        batch_size=batch_size,
+        length=length,
+        stride=stride,
+        verbose=verbose
+    )
+
+    meta = {'num_channels': 1, 'seq_len': length, 'num_classes': 2}
+    return tr, va, te, meta
+	
 def _sanitize_and_standardize_window(x: np.ndarray, clip_val: float = 10.0) -> np.ndarray:
     """
     Robust per-window standardization that never emits NaN/Inf.
@@ -10129,7 +10150,7 @@ MODEL_ALIASES = {
 }
 # -------------------- Dataset Registry --------------------
 DATASET_REGISTRY = {}
-register_dataset('apnea_ecg', _load_apnea_for_registry)
+register_dataset('apnea_ecg', _apnea_gcs_wrapper)
 
 register_ptb = False
 if register_ptb:
