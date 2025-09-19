@@ -807,7 +807,7 @@ def stratified_by_minutes_split(root, records, seed=1337, frac=(0.8,0.1,0.1), ta
 
     tra = splits[0]['recs']; val = splits[1]['recs']; tes = splits[2]['recs']
     return tra, val, tes
-
+'''
 # Loader alias shims
 def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, verbose=True, seed=1337):
     """
@@ -870,7 +870,7 @@ def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, v
         raise RuntimeError("No windows built. Check .apn presence and that length < 6000.")
 
     return dl_tr, dl_va, dl_te
-
+'''
 # ==== PTB-XL preprocessing & loaders ====
 AAMI_MAP = {
     # N: normal and LBBB/RBBB etc.
