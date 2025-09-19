@@ -8,9 +8,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
-def line(): print("-"*80)
 
-THRESH_GRID = np.linspace(0.05, 0.95, 19)
+from torch.utils.data import Sampler
+
+
 
 
 import os, random, numpy as np, wfdb, torch
@@ -31,7 +32,8 @@ except Exception:
     from torch.utils.data import random_split, RandomSampler, WeightedRandomSampler
 
 FS = 100  # Apnea-ECG sampling rate
-
+THRESH_GRID = np.linspace(0.05, 0.95, 19)
+def line(): print("-"*80)
 
 # --- Normalize different dataset returns to (tr, va, te, meta) ---
 def _normalize_dataset_return(ret):
@@ -913,38 +915,6 @@ def _dir_has_any(root: Path, exts=(".dat",".hea",".apn",".csv",".mat",".atr")):
     except Exception:
         pass
     return False
-
-
-class StratifiedBatchSampler(Sampler):
-    """
-    Yields indices so each batch is balanced 0/1 as much as possible.
-    Requires dataset to expose labels via dataset.index + dataset._labs (true for ApneaECGWindows).
-    """
-    def __init__(self, dataset, batch_size, seed=1337):
-        self.ds = dataset
-        self.batch = batch_size
-        rng = random.Random(seed)
-        pos_idx, neg_idx = [], []
-        for i,(rid,m,off) in enumerate(dataset.index):
-            (pos_idx if dataset._labs[rid][m]==1 else neg_idx).append(i)
-        rng.shuffle(pos_idx); rng.shuffle(neg_idx)
-        self.pos_idx, self.neg_idx = pos_idx, neg_idx
-        self.n_batches = math.ceil((len(pos_idx)+len(neg_idx))/batch_size)
-
-    def __len__(self): return self.n_batches
-
-    def __iter__(self):
-        p, n = 0, 0
-        half = self.batch//2
-        while p < len(self.pos_idx) or n < len(self.neg_idx):
-            cur = []
-            for _ in range(half):
-                if p < len(self.pos_idx): cur.append(self.pos_idx[p]); p += 1
-            while len(cur) < self.batch and n < len(self.neg_idx):
-                cur.append(self.neg_idx[n]); n += 1
-            if not cur: break
-            yield cur
-
 
 def ext_counts(root: Path, max_depth=10, limit=None):
     """Count file extensions under root (any depth)."""
