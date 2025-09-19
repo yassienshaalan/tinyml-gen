@@ -28,6 +28,7 @@ import ast
 import pandas as pd
 from typing import List, Tuple
 import pandas as pd
+DATASET_REGISTRY = {}
 # Toggle: use class-balanced sampling in the TRAIN loader
 USE_WEIGHTED_SAMPLER = True
 try:
