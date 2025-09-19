@@ -288,8 +288,57 @@ def _record_apnea_stats(root: Union[str, Path], records: list[str]):
 def _records_from_index(ds):
     return sorted({rid for (rid, _, _) in ds.dataset.index})
 
-# NOTE: The following helpers are assumed to exist in your project:
-# _stratified_record_split_apnea, USE_WEIGHTED_SAMPLER, _make_weighted_sampler_apnea, _wif, print_class_distribution
+def _stratified_record_split_apnea(root, recs, seed=1337, frac=(0.8, 0.1, 0.1)):
+    """
+    Record-wise stratified split for Apnea-ECG.
+    - Groups by record (subject) → prevents leakage across splits.
+    - Stratifies by 'has any apnea-positive minutes' to balance splits.
+    Returns: (train_recs, val_recs, test_recs)
+    """
+    import random, os
+
+    rng = random.Random(seed)
+
+    def _has_apnea_positive(record_id):
+        # Use your existing stats helper if present
+        try:
+            stats = _record_apnea_stats(root, [record_id])  # [(rec, apnea_minutes, total_minutes, ...)]
+            if stats:
+                _, a_pos, *_ = stats[0]
+                return a_pos > 0
+        except NameError:
+            pass
+        # Fallback: scan .apn file (A/N per minute). Adjust if your loader differs.
+        apn_path = os.path.join(root, f"{record_id}.apn")
+        if not os.path.exists(apn_path):
+            return False
+        with open(apn_path, "r") as f:
+            txt = f.read()
+        return "A" in txt
+
+    pos, neg = [], []
+    for r in recs:
+        (pos if _has_apnea_positive(r) else neg).append(r)
+
+    rng.shuffle(pos); rng.shuffle(neg)
+
+    def _split(lst):
+        n = len(lst)
+        ntr = int(round(frac[0] * n))
+        nva = int(round(frac[1] * n))
+        return lst[:ntr], lst[ntr:ntr + nva], lst[ntr + nva:]
+
+    trp, vap, tep = _split(pos)
+    trn, van, ten = _split(neg)
+
+    train_recs = trp + trn
+    val_recs   = vap + van
+    test_recs  = tep + ten
+
+    rng.shuffle(train_recs); rng.shuffle(val_recs); rng.shuffle(test_recs)
+    return train_recs, val_recs, test_recs
+
+	
 def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, verbose=True, seed=1337):
     root = root if isinstance(root, str) else str(root)
     if verbose:
