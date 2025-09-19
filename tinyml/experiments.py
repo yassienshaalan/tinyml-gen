@@ -1640,6 +1640,73 @@ def _has_data(loader):
         for _ in loader:
             return True
         return False
+class ExpCfg:
+    # --- Training ---
+    epochs: int = 8
+    epochs_cnn: Optional[int] = None
+    epochs_head: Optional[int] = None
+    epochs_vae_pre: Optional[int] = None
+    warmup_epochs: int = 1
+
+    # --- Optimizer ---
+    lr: float = 3e-4
+    weight_decay: float = 1e-4
+
+    # --- Data loading ---
+    batch_size: int = 64
+    num_workers: int = 2
+    limit: Optional[int] = None
+
+    # --- Windowing / signal ---
+    window_ms: int = 60000
+    target_fs: int = 100
+    input_len: Optional[int] = None         # alias A
+    input_length: Optional[int] = None      # alias B
+    length: int = 1800                      # if some code uses 'length' for windows
+
+    # --- Model knobs ---
+    base: int = 24                          # << numeric channel base (not a path)
+    width_base: Optional[int] = None        # if used elsewhere, keep in sync with base
+    width_mult: float = 1.0
+    latent_dim: int = 16
+
+    # --- Aug/Loss toggles ---
+    use_mixup: bool = False
+    mixup_alpha: float = 0.2
+    use_focal_loss: bool = False
+    use_label_smoothing: bool = False
+
+    # --- Misc / paths ---
+    data_base: Optional[str] = None         # << use this if you need a base *path*
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def __post_init__(self):
+        # epochs fallbacks
+        if self.epochs_cnn is None:
+            self.epochs_cnn = self.epochs
+        if self.epochs_head is None:
+            self.epochs_head = max(1, self.epochs // 2)
+        if self.epochs_vae_pre is None:
+            self.epochs_vae_pre = max(1, self.epochs // 2)
+
+        # input length unification
+        if self.input_len is None and self.input_length is not None:
+            self.input_len = self.input_length
+        if self.input_len is None and self.window_ms and self.target_fs:
+            self.input_len = int((self.window_ms / 1000.0) * self.target_fs)
+        self.input_length = self.input_len  # keep both aliases consistent
+
+        # numeric base unification
+        self.base = int(self.base)
+        if self.width_base is None:
+            self.width_base = self.base
+        else:
+            self.width_base = int(self.width_base)
+
+        # minor normalisation
+        if isinstance(self.limit, float):
+            self.limit = int(self.limit)
+
 
 def _safe_make_apnea_loaders(root: str, cfg: ExpCfg):
     try:
