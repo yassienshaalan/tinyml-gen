@@ -19,7 +19,18 @@ except Exception:
 
 def _is_gcs_path(p: Union[str, Path]) -> bool:
     return str(p).startswith("gs://")
-
+	
+def _normalize_gs_uri(uri: str) -> str:
+    if not isinstance(uri, str):
+        return uri
+    # Fix common typos: gs:/bucket -> gs://bucket  ; collapse runs of slashes after scheme
+    if uri.startswith("gs:/") and not uri.startswith("gs://"):
+        uri = "gs://" + uri[len("gs:/"):].lstrip("/")
+    # Remove accidental triple slashes after scheme
+    uri = re.sub(r"^gs:/{3,}", "gs://", uri)
+    return uri
+	
+	
 def _gcsfs():
     if gcsfs is None:
         raise ImportError("gcsfs is required for gs:// paths. Install with: pip install gcsfs")
@@ -99,10 +110,10 @@ def _record_base_paths(root: Union[str, Path], rid: str, needed_exts: List[str])
 # =============================
 # Config (env-overridable)
 # =============================
-DATA_BASE = os.environ.get("TINYML_DATA_ROOT", "gs://store-pepper/tinyml_hyper_tiny_baselines/data")
-APNEA_ROOT = os.environ.get("APNEA_ROOT", f"{DATA_BASE}/apnea-ecg-database-1.0.0")
-PTBXL_ROOT = os.environ.get("PTBXL_ROOT", f"{DATA_BASE}/ptbxl")
-MITDB_ROOT = os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih/raw")
+DATA_BASE = _normalize_gs_uri(os.environ.get("TINYML_DATA_ROOT", "gs://store-pepper/tinyml_hyper_tiny_baselines/data"))
+APNEA_ROOT = _normalize_gs_uri(os.environ.get("APNEA_ROOT", f"{DATA_BASE}/apnea-ecg-database-1.0.0"))
+PTBXL_ROOT = _normalize_gs_uri(os.environ.get("PTBXL_ROOT", f"{DATA_BASE}/ptbxl"))
+MITDB_ROOT = _normalize_gs_uri(os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih/raw"))
 
 FS = 100  # Apnea-ECG sampling rate
 
