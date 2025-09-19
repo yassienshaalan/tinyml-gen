@@ -38,7 +38,7 @@ PTBXL_ROOT = os.environ.get("PTBXL_ROOT", f"{DATA_BASE}/ptbxl")
 MITDB_ROOT = os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih/raw")
 
 for p in [APNEA_ROOT, PTBXL_ROOT, MITDB_ROOT]:
-    p.mkdir(parents=True, exist_ok=True)
+    Path(p).mkdir(parents=True, exist_ok=True)
 
 print("[Paths]")
 print("  APNEA_ROOT:", APNEA_ROOT)
@@ -776,7 +776,7 @@ def _results_dir(prefer="MyDrive/tinyml_hyper_tiny_baselines/results"):
     _ensure_drive_mounted()
     # 1) Try MyDrive path
     p = Path("/content/drive") / prefer
-    p.mkdir(parents=True, exist_ok=True)
+    Path(p).mkdir(parents=True, exist_ok=True)
     if p.exists():
         return p
     # 2) Try under any Shareddrive (if user uses a Team Drive)
@@ -786,16 +786,16 @@ def _results_dir(prefer="MyDrive/tinyml_hyper_tiny_baselines/results"):
         matches = list(sd_root.rglob("tinyml_hyper_tiny_baselines"))
         if matches:
             p = matches[0] / "results"
-            p.mkdir(parents=True, exist_ok=True)
+            Path(p).mkdir(parents=True, exist_ok=True)
             return p
         # fallback: create in first share drive
         shares = [d for d in sd_root.iterdir() if d.is_dir()]
         if shares:
             p = shares[0] / "tinyml_hyper_tiny_baselines" / "results"
-            p.mkdir(parents=True, exist_ok=True)
+            Path(p).mkdir(parents=True, exist_ok=True)
             return p
     # 3) Last resort: local current dir
-    p = Path("./results"); p.mkdir(parents=True, exist_ok=True); return p
+    p = Path("./results"); Path(p).mkdir(parents=True, exist_ok=True); return p
 class AugmentECG:
     def __init__(self, noise_std=0.01, amp_jitter=0.05, time_shift_frac=0.02, p=0.8):
         self.noise_std = noise_std
