@@ -3363,101 +3363,7 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
           'num_classes': meta.get('num_classes', None),
     }
     return results
-'''
-def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None, models: List[str]=None):
-    """Run comprehensive experiments across all dataset+model combinations"""
-    if datasets is None:
-        datasets = available_datasets()
-    if models is None:
-        models = [
-              'hrv_featnet',
-              'cnn3_small',
-              'resnet1d_small',
-              'tiny_separable_cnn',
-              'tiny_vae_head',
-              'tiny_method',
-              'regular_cnn',
-          ]
 
-    print("\n" + "="*80)
-    print(" COMPREHENSIVE TINYML EXPERIMENTS")
-    print("="*80)
-    print(f" Datasets: {datasets}")
-    print(f" Models: {models}")
-    print(f"  Config: epochs={cfg.epochs}, batch_size={cfg.batch_size}, limit={cfg.limit}")
-    print(f" Device: {cfg.device}")
-
-    results = []
-    total_experiments = len(datasets) * len(models)
-    current_exp = 0
-
-    for ds in datasets:
-        if ds not in available_datasets():
-            print(f'  Skipping unavailable dataset: {ds}')
-            continue
-
-        for model in models:
-            current_exp += 1
-            print(f'\n📍 Experiment {current_exp}/{total_experiments}')
-
-            try:
-                result = run_experiment(cfg, ds, model)
-                if result:
-                    results.append(result)
-                    print(f' Completed: {ds} + {model}')
-                else:
-                    print(f'Failed: {ds} + {model}')
-            except Exception as e:
-                print(f'💥 Exception in {ds} + {model}: {e}')
-                import traceback
-                traceback.print_exc()
-
-    if results:
-        print(f'\n{"="*80}')
-        print(" EXPERIMENT RESULTS SUMMARY")
-        print("="*80)
-
-        df = pd.DataFrame(results)
-        pf = plot_pareto(df, x='flash_kb', y='test_f1_at_t')
-        print("\nPARETO FRONTIER (non-dominated points):")
-        print(pf[['model','flash_kb','test_f1_at_t']])
-
-        print(f" Completed experiments: {len(results)}/{total_experiments}")
-        print(f"📈 Average validation accuracy: {df['val_acc'].mean():.4f} ± {df['val_acc'].std():.4f}")
-        print(f" Average model size: {df['flash_kb'].mean():.1f} KB")
-
-        print(f"\n{'='*80}")
-        print("MODEL COMPARISON")
-        print("="*80)
-        comparison_cols = ['dataset', 'model', 'val_acc', 'test_acc', 'flash_kb', 'params', 'train_time_s']
-        print(df[comparison_cols].to_string(index=False, float_format='%.4f'))
-
-        print(f"\n{'='*60}")
-        print("ANALYSIS BY MODEL TYPE")
-        print("="*60)
-        model_analysis = df.groupby('model').agg({
-            'val_acc': ['mean', 'std'],
-            'flash_kb': 'mean',
-            'params': 'mean',
-            'train_time_s': 'mean'
-        }).round(4)
-        print(model_analysis)
-
-        df['efficiency'] = df['val_acc'] / df['flash_kb']
-        print(f"\n{'='*60}")
-        print("EFFICIENCY ANALYSIS (Accuracy per KB)")
-        print("="*60)
-        efficiency_analysis = df.groupby('model')['efficiency'].agg(['mean', 'std']).round(6)
-        print(efficiency_analysis.sort_values('mean', ascending=False))
-
-        results_file = 'comprehensive_tinyml_results.csv'
-        df.to_csv(results_file, index=False)
-        print(f"\n Results saved to: {results_file}")
-        return df
-    else:
-        print("No experiments completed successfully")
-        return None
-'''
 
 def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None):
     # Datasets to run
@@ -10127,39 +10033,6 @@ def run_one(spec):
     print(f" Success: {name}")
 
 
-def run_suite(parallel: bool = False, max_workers: int = None):
-    """
-    Runs EXPERIMENTS sequentially by default.
-    Set parallel=True to run with a ThreadPool (safer in notebooks than processes).
-    """
-    if not EXPERIMENTS:
-        print("No experiments defined for available datasets.")
-        return
-
-    names = [e['name'] for e in EXPERIMENTS]
-    print(f"Planned experiments: {names}")
-
-    if not parallel:
-        for spec in EXPERIMENTS:
-            run_one(spec)
-        return
-
-    # Parallel (threads) — PyTorch releases the GIL during compute, so this helps on CPU.
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    max_workers = max_workers or min(8, len(EXPERIMENTS))
-
-    futures = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for spec in EXPERIMENTS:
-            futures[ex.submit(run_one, spec)] = spec['name']
-
-        for fut in as_completed(futures):
-            name = futures[fut]
-            try:
-                fut.result()
-                print(f"[DONE] {name}")
-            except Exception as e:
-                print(f"[FAIL] {name} → {e}")
 
 def get_loaders(ds_key, batch=64, verbose=True, force_reload=False):
     """
