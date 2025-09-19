@@ -97,7 +97,7 @@ class RegularCNN(nn.Module):
         x = self.body(x)
         x = self.pool(x).squeeze(-1)
         return self.fc(x)
-'''
+
 
 
 class RegularCNN1D(nn.Module):

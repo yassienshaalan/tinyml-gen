@@ -1,7 +1,7 @@
 
 import math, os, json, random
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -9,52 +9,141 @@ import torch
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import wfdb
 
-ROOT = Path('/content/drive/MyDrive/tinyml_hyper_tiny_baselines')
-EXP_DIR = ROOT / ('experiments_v14_fixed_kd_v2' if True else 'experiments_v14_fixed_v2')
-APNEA_ROOT = Path("/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data/apnea-ecg-database-1.0.0")
-PTBXL_ROOT = Path("/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data/ptbxl")
-MITDB_ROOT = Path("/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data/mitbih/raw") #UCI HAR Dataset")
-APNEA_ROOT = Path(APNEA_ROOT)
+# =============================
+# GCS support (optional)
+# =============================
+try:
+    import gcsfs  # pip install gcsfs
+except Exception:
+    gcsfs = None
+
+def _is_gcs_path(p: Union[str, Path]) -> bool:
+    return str(p).startswith("gs://")
+
+def _gcsfs():
+    if gcsfs is None:
+        raise ImportError("gcsfs is required for gs:// paths. Install with: pip install gcsfs")
+    # Uses Application Default Credentials on GCP VM
+    return gcsfs.GCSFileSystem(cache_timeout=60)
+
+# Local cache for WFDB files fetched from GCS
+DATA_GCS_CACHE = Path(os.environ.get("DATA_GCS_CACHE", "/tmp/data_gcs_cache"))
+DATA_GCS_CACHE.mkdir(parents=True, exist_ok=True)
+
+def _gcs_join(*parts: str) -> str:
+    out = str(parts[0]).rstrip("/")
+    for p in parts[1:]:
+        out += "/" + str(p).lstrip("/")
+    return out
+
+def _gcs_ls(prefix: str) -> List[str]:
+    fs = _gcsfs()
+    try:
+        return fs.ls(prefix)
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+def _gcs_exists(path: str) -> bool:
+    fs = _gcsfs()
+    try:
+        return fs.exists(path)
+    except Exception:
+        return False
+
+def _gcs_get_file(src: str, dst: Path):
+    """Download a single file from GCS to local dst if not present."""
+    if dst.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fs = _gcsfs()
+    with fs.open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        fdst.write(fsrc.read())
+
+def _ensure_local_record(gcs_dir: str, rid: str, exts: List[str]) -> Path:
+    """
+    Ensure local copies of WFDB record files (e.g., .hea/.dat/.apn) for record 'rid' under gcs_dir.
+    Returns the local directory containing the files.
+    """
+    if not _is_gcs_path(gcs_dir):
+        return Path(gcs_dir)
+    local_dir = DATA_GCS_CACHE / Path(gcs_dir.replace("gs://", "")).as_posix().replace("/", "_") / rid
+    for ext in exts:
+        _gcs_get_file(_gcs_join(gcs_dir, f"{rid}.{ext}"), local_dir / f"{rid}.{ext}")
+    return local_dir
+
+def _record_base_paths(root: Union[str, Path], rid: str, needed_exts: List[str]) -> str:
+    """
+    Return a base path (without extension) that wfdb.* can use.
+    If root is gs://, ensure files are cached locally first.
+    """
+    root = str(root)
+    if _is_gcs_path(root):
+        local_dir = _ensure_local_record(root, rid, needed_exts)
+        return str(local_dir / rid)
+    else:
+        return str(Path(root) / rid)
+
+# =============================
+# Config
+# =============================
+# Data roots can be either local or gs://; defaults can be overridden via env vars.
+DATA_BASE = os.environ.get("TINYML_DATA_ROOT", "/content/drive/MyDrive/tinyml_hyper_tiny_baselines/data")
+APNEA_ROOT = os.environ.get("APNEA_ROOT", f"{DATA_BASE}/apnea-ecg-database-1.0.0")
+PTBXL_ROOT = os.environ.get("PTBXL_ROOT", f"{DATA_BASE}/ptbxl")
+MITDB_ROOT = os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih/raw")
+
 FS = 100  # Apnea-ECG sampling rate
 
-def _list_trainable_records(root: Path):
+# =============================
+# Apnea-ECG (GCS-aware)
+# =============================
+def _list_trainable_records(root: Union[str, Path]):
     """
     Use only learning-set records that truly have .apn: a**, b**, c**.
     Exclude x** (no labels) and *er variants.
     Require .dat, .hea, .apn to exist.
     """
+    root = str(root)
     recs = []
-    for hea in Path(root).glob("*.hea"):
-        rid = hea.stem
-        if not rid.startswith(("a","b","c")):     # drop x**
-            continue
-        if rid.endswith("er"):                    # edited variants often incomplete
-            continue
-        if (Path(root)/f"{rid}.dat").exists() and (Path(root)/f"{rid}.apn").exists():
-            recs.append(rid)
-    return sorted(recs)
+    if _is_gcs_path(root):
+        for f in _gcs_ls(root):
+            p = Path(f)
+            if p.suffix == ".hea":
+                rid = p.stem
+                if not rid.startswith(("a", "b", "c")):  # drop x**
+                    continue
+                if rid.endswith("er"):
+                    continue
+                dat_ok = _gcs_exists(_gcs_join(root, f"{rid}.dat"))
+                apn_ok = _gcs_exists(_gcs_join(root, f"{rid}.apn"))
+                if dat_ok and apn_ok:
+                    recs.append(rid)
+    else:
+        for hea in Path(root).glob("*.hea"):
+            rid = hea.stem
+            if not rid.startswith(("a","b","c")):
+                continue
+            if rid.endswith("er"):
+                continue
+            if (Path(root)/f"{rid}.dat").exists() and (Path(root)/f"{rid}.apn").exists():
+                recs.append(rid)
+    return sorted(set(recs))
 
+def _minute_labels_rdann(root: Union[str, Path], rid: str):
+    base = _record_base_paths(root, rid, needed_exts=["apn", "hea", "dat"])
+    ann = wfdb.rdann(base, 'apn')
+    return [1 if s.upper() == 'A' else 0 for s in ann.symbol]
 
-
-def _minute_labels_rdann(root: Path, rid: str):
-    """Read minute labels from WFDB .apn (binary) → list[int] 1=A, 0=N."""
-    ann = wfdb.rdann((Path(root)/rid).as_posix(), 'apn')
-    return [1 if s.upper()=='A' else 0 for s in ann.symbol]
-
-
-
-def _load_signal(root: Path, rid: str) -> np.ndarray:
-    base = (Path(root) / rid).as_posix()
-
-    # Try rdsamp() first (returns (signals, fields))
+def _load_signal(root: Union[str, Path], rid: str) -> np.ndarray:
+    base = _record_base_paths(root, rid, needed_exts=["hea", "dat"])
     try:
         sig, fields = wfdb.rdsamp(base)
-        # Choose ECG channel if available, else use first column
         idx = 0
         try:
             names = fields.get('sig_name', None)
             if names and isinstance(names, (list, tuple)):
-                # Look for 'ECG' (case-insensitive) or any name containing 'ECG'
                 match_idx = None
                 for i, nm in enumerate(names):
                     if str(nm).lower() == 'ecg' or 'ecg' in str(nm).lower():
@@ -64,18 +153,14 @@ def _load_signal(root: Path, rid: str) -> np.ndarray:
                     idx = match_idx
         except Exception:
             pass
-
         sig_arr = sig[:, idx] if sig.ndim > 1 else sig
         return sig_arr.astype(np.float32)
     except Exception:
-        # Fallback: rdrecord() -> Record object with p_signal (or d_signal)
         rec = wfdb.rdrecord(base)
         if rec.p_signal is not None:
             sig = rec.p_signal
         else:
-            # Last resort: integer d_signal (may be unscaled). Use as float.
             sig = rec.d_signal.astype(np.float32)
-        # Pick ECG channel if available
         idx = 0
         try:
             if hasattr(rec, 'sig_name') and rec.sig_name:
@@ -88,48 +173,27 @@ def _load_signal(root: Path, rid: str) -> np.ndarray:
                     idx = match_idx
         except Exception:
             pass
-
         sig_arr = sig[:, idx] if sig.ndim > 1 else sig
         return sig_arr.astype(np.float32)
 
-
-
 def _sanitize_and_standardize_window(x: np.ndarray, clip_val: float = 10.0) -> np.ndarray:
-    """
-    Robust per-window standardization that never emits NaN/Inf.
-    - Converts NaN/Inf → finite
-    - If variance is tiny: center-only
-    - Else: z-score with epsilon
-    - Clips extremes for stability
-    """
     x = np.asarray(x, dtype=np.float32, order="C")
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-
     m = float(x.mean())
     v = float(x.var())
-
     if not np.isfinite(m):
         m = 0.0
     if (not np.isfinite(v)) or (v < 1e-4):
         x = x - m
     else:
         x = (x - m) / np.sqrt(v + 1e-6)
-
     if clip_val is not None:
         x = np.clip(x, -clip_val, clip_val)
     return x.astype(np.float32, copy=False)
 
-
-
 class ApneaECGWindows(Dataset):
-    """
-    Drop-in replacement:
-      - Works with your ExpCfg(input_len=1800, stride=None)
-      - Creates one or more 18s windows INSIDE each labeled minute (6000 samples)
-      - Every window in a minute inherits that minute's A/N label
-    """
-    def __init__(self, root: Path, records, length: int, stride: int|None=None, normalize="per_window", verbose=True):
-        self.root = Path(root)
+    def __init__(self, root: Union[str, Path], records, length: int, stride: int|None=None, normalize="per_window", verbose=True):
+        self.root = root if isinstance(root, str) else str(root)
         self.records = list(records)
         self.length  = int(length)
         self.stride  = int(length) if stride is None else int(stride)
@@ -144,13 +208,13 @@ class ApneaECGWindows(Dataset):
 
         self._sig_cache = {}
         self._labs = {}
-        self.index = []   # tuples: (rid, minute_idx, offset)
+        self.index = []
 
         offsets = list(range(0, max_start+1, self.stride)) or [0]
 
         for rid in self.records:
-            # fs check
-            hdr = wfdb.rdheader((self.root / rid).as_posix())
+            base = _record_base_paths(self.root, rid, needed_exts=["hea"])
+            hdr = wfdb.rdheader(base)
             if int(round(hdr.fs)) != FS:
                 if self.verbose: print(f"[ApneaECGWindows] Skip {rid}: fs={hdr.fs} != 100Hz")
                 continue
@@ -186,76 +250,54 @@ class ApneaECGWindows(Dataset):
       start = m*FS*60 + off
       end   = start + self.length
 
-      # --- window extraction with safe padding ---
       if start >= len(sig):
-          # CHANGED: explicit zero padding
           chunk = np.zeros((self.length,), dtype=np.float32)
       else:
           if end > len(sig):
               pad = end - len(sig)
-              # CHANGED: prefer constant-zero padding (avoids repeated-edge flat segments)
-              # If you really want edge padding, keep mode="edge" – sanitizer below handles it anyway.
               chunk = np.pad(sig[start:], (0, pad), mode="constant", constant_values=0.0)
           else:
               chunk = sig[start:end]
 
-      # --- robust per-window standardization (NaN-safe) ---
       if getattr(self, "normalize", None) == "per_window":
-          chunk = _sanitize_and_standardize_window(chunk)   # CHANGED
+          chunk = _sanitize_and_standardize_window(chunk)
       else:
-          # Even if not normalizing, ensure no NaN/Inf propagate
-          chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)  # CHANGED
+          chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
 
-      # --- label mapping (robust for 'A'/'N' or ints) ---
       raw_y = labs[m]
       if isinstance(raw_y, (str, bytes)):
-          # Apnea ('A') → 1, Normal ('N') → 0, anything else → 0
-          y = 1 if (raw_y == 'A' or raw_y == b'A' or raw_y == '1' or raw_y == b'1') else 0  # CHANGED
+          y = 1 if (raw_y == 'A' or raw_y == b'A' or raw_y == '1' or raw_y == b'1') else 0
       else:
           try:
               yi = int(raw_y)
-              y = 1 if yi == 1 else 0   # CHANGED (force {0,1})
+              y = 1 if yi == 1 else 0
           except Exception:
               y = 0
 
-      # --- final guards ---
       if not np.isfinite(chunk).all():
-          chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)  # CHANGED
+          chunk = np.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
 
       x = torch.from_numpy(chunk.astype(np.float32)).unsqueeze(0)  # [1, T]
       y = torch.tensor(y, dtype=torch.long)
       return x, y
 
-
-
-
-def _record_apnea_stats(root: Path, records: list[str]):
+def _record_apnea_stats(root: Union[str, Path], records: list[str]):
     stats = []
     for rid in records:
-        labs = _minute_labels_rdann(root, rid)  # Fixed: was minute_labels(root, rid)
+        labs = _minute_labels_rdann(root, rid)
         a = int(sum(labs))
         n = int(len(labs) - a)
         prev = a / max(1, a + n)
         stats.append((rid, a, n, prev))
     return stats
 
-
-
 def _records_from_index(ds):
-    # works if ds.dataset.index stores tuples (rid, m, off)
     return sorted({rid for (rid, _, _) in ds.dataset.index})
 
-
-
+# These helpers must exist elsewhere in your project (unchanged):
+# _stratified_record_split_apnea, USE_WEIGHTED_SAMPLER, _make_weighted_sampler_apnea, _wif, print_class_distribution
 def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, verbose=True, seed=1337):
-    """
-    Stratified version of the loader:
-      - filters to a**, b**, c** with .apn
-      - minute-aligned windows with length=stride=1800 by default
-      - stratified split by RECORD to ensure val/test contain apnea-positive records
-      - optional WeightedRandomSampler for the TRAIN loader
-    """
-    root = Path(root)
+    root = root if isinstance(root, str) else str(root)
     if verbose:
         print(f"[ApneaECG] root={root} | length={length} | stride={stride}")
 
@@ -265,9 +307,8 @@ def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, v
     if not recs:
         raise RuntimeError("No usable records (need a**, b**, c** with .apn/.dat/.hea).")
 
-    # --- stratified split by record ---
     train_recs, val_recs, test_recs = _stratified_record_split_apnea(root, recs, seed=seed, frac=(0.8,0.1,0.1))
-    #train_recs, val_recs, test_recs = stratified_by_minutes_split(root, recs, seed=seed, frac=(0.8,0.1,0.1))
+
     if verbose:
         tr_stats = _record_apnea_stats(root, train_recs)
         va_stats = _record_apnea_stats(root, val_recs)
@@ -278,12 +319,10 @@ def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, v
               f"{sum(1 for _,a,_,_ in va_stats if a>0)} | "
               f"{sum(1 for _,a,_,_ in te_stats if a>0)}")
 
-    # --- datasets ---
     ds_tr = ApneaECGWindows(root, train_recs, length=length, stride=stride, verbose=verbose)
     ds_va = ApneaECGWindows(root, val_recs,   length=length, stride=stride, verbose=verbose)
     ds_te = ApneaECGWindows(root, test_recs,  length=length, stride=stride, verbose=verbose)
 
-    # --- loaders (optionally weighted sampler for train) ---
     num_workers = 2 if torch.cuda.is_available() else 0
     if USE_WEIGHTED_SAMPLER:
         sampler = _make_weighted_sampler_apnea(ds_tr)
@@ -293,14 +332,13 @@ def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, v
     dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False, worker_init_fn=_wif)
     dl_te = DataLoader(ds_te, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False, worker_init_fn=_wif)
 
-    # quick distributions
-    print("\n=== ApneaECG Train class distribution (approx) ===")
+    print("\\n=== ApneaECG Train class distribution (approx) ===")
     print_class_distribution(dl_tr, "ApneaECG Train")
     print("========================================")
-    print("\n=== ApneaECG Val class distribution (approx) ===")
+    print("\\n=== ApneaECG Val class distribution (approx) ===")
     print_class_distribution(dl_va, "ApneaECG Val")
     print("========================================")
-    print("\n=== ApneaECG Test class distribution (approx) ===")
+    print("\\n=== ApneaECG Test class distribution (approx) ===")
     print_class_distribution(dl_te, "ApneaECG Test")
     print("========================================")
 
@@ -309,24 +347,20 @@ def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, v
 
     return dl_tr, dl_va, dl_te
 
-# ==== PTB-XL preprocessing & loaders ====
+# =============================
+# MIT-BIH (GCS-aware)
+# =============================
 AAMI_MAP = {
-    # N: normal and LBBB/RBBB etc.
     'N':'N', 'L':'N', 'R':'N', 'e':'N', 'j':'N',
-    # S: supraventricular ectopic
     'A':'S','a':'S','J':'S','S':'S',
-    # V: ventricular ectopic
     'V':'V','E':'V',
-    # F: fusion
     'F':'F',
-    # Q: unknown / paced / artifact
     '/':'Q','f':'Q','Q':'Q','|':'Q','~':'Q','!':'Q','x':'Q','t':'Q','p':'Q','u':'Q'
 }
 
-
-
-def _read_signal_record(root: Path, rec: str, prefer_lead_idx=0):
-    record = wfdb.rdrecord(str(root/rec))
+def _read_signal_record(root: Union[str, Path], rec: str, prefer_lead_idx=0):
+    base = _record_base_paths(root, rec, needed_exts=["hea", "dat"])
+    record = wfdb.rdrecord(base)
     X = np.asarray(record.p_signal, dtype=np.float32)  # (T, L)
     fs = int(record.fs)
     L = X.shape[1]
@@ -334,17 +368,22 @@ def _read_signal_record(root: Path, rec: str, prefer_lead_idx=0):
     x = X[:, idx]
     return x, fs
 
-
-
-def _read_beats(root: Path, rec: str):
-    ann = wfdb.rdann(str(root/rec), 'atr')
+def _read_beats(root: Union[str, Path], rec: str):
+    base = _record_base_paths(root, rec, needed_exts=["hea", "dat", "atr"])
+    ann = wfdb.rdann(base, 'atr')
     return np.asarray(ann.sample), ann.symbol  # sample indices, symbols
 
-
+def _window_around(center: int, T: int, L: int):
+    s = max(0, center - L//2)
+    e = s + L
+    if e > T:
+        e = T
+        s = max(0, e - L)
+    return s, e
 
 class MITBIHBeats(Dataset):
-    def __init__(self, root: str|Path, records: list[str], length: int = 1800, binary=True, zscore=True):
-        self.root = Path(root)
+    def __init__(self, root: Union[str, Path], records: list[str], length: int = 1800, binary=True, zscore=True):
+        self.root = root if isinstance(root, str) else str(root)
         self.length = int(length)
         self.binary = binary
         self.zscore = zscore
@@ -357,15 +396,14 @@ class MITBIHBeats(Dataset):
             except Exception:
                 continue
             for s, sym in zip(rpeaks, symbols):
-                # map label
                 aami = AAMI_MAP.get(sym, 'Q')
                 if self.binary:
-                    y = 1 if aami == 'V' else 0   # PVC (AAMI 'V') positive, everything else negative
+                    y = 1 if aami == 'V' else 0
                 else:
                     cls = {'N':0,'S':1,'V':2,'F':3,'Q':4}
                     y = cls.get(aami, 4)
                 st, en = _window_around(s, len(x), self.length)
-                if en - st != self.length or st < 0:  # skip too-short
+                if en - st != self.length or st < 0:
                     continue
                 self.items.append((rec, st, en, y))
 
@@ -382,17 +420,26 @@ class MITBIHBeats(Dataset):
         seg = np.expand_dims(seg.astype(np.float32), 0)
         return torch.from_numpy(seg), torch.tensor(int(y), dtype=torch.long)
 
+def _mitbih_records(root: Union[str, Path]) -> List[str]:
+    root = str(root)
+    recs = []
+    if _is_gcs_path(root):
+        for f in _gcs_ls(root):
+            if f.endswith(".hea"):
+                recs.append(Path(f).stem)
+    else:
+        for p in Path(root).glob("*.hea"):
+            recs.append(p.stem)
+    return sorted(set(recs))
 
-
-def load_mitdb_loaders(root: str|Path, batch_size=64, length=1800, binary=True):
-    root = Path(root)
-    if not root.exists():
+def load_mitdb_loaders(root: Union[str, Path], batch_size=64, length=1800, binary=True):
+    root = root if isinstance(root, str) else str(root)
+    if not _is_gcs_path(root) and not Path(root).exists():
         raise FileNotFoundError(f"MITDB root not found: {root}")
     recs = _mitbih_records(root)
     if not recs:
         raise RuntimeError(f"No .hea records found under {root}")
 
-    # deterministic split by record name
     recs = sorted(recs)
     n = len(recs)
     tr_recs = recs[: int(0.8*n)]
@@ -408,27 +455,58 @@ def load_mitdb_loaders(root: str|Path, batch_size=64, length=1800, binary=True):
     te = DataLoader(te_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=2, worker_init_fn=_wif)
     return tr, va, te, {"binary": binary, "records": {"train": len(tr_recs), "val": len(va_recs), "test": len(te_recs)}}
 
+# =============================
+# PTB-XL (GCS-aware)
+# =============================
+def _ptbxl_paths(root: Union[str, Path]):
+    root = str(root)
+    if _is_gcs_path(root):
+        raw = _gcs_join(root, "raw")
+        csv = _gcs_join(raw, "ptbxl_database.csv")
+        scp = _gcs_join(raw, "scp_statements.csv")
+        if not _gcs_exists(csv) or not _gcs_exists(scp):
+            raise FileNotFoundError(f"Could not find ptbxl_database.csv / scp_statements.csv under: {root}")
+        return csv, scp, raw
+    else:
+        rootp = Path(root)
+        raw = rootp / "raw"
+        if (raw / "ptbxl_database.csv").exists():
+            return raw / "ptbxl_database.csv", raw / "scp_statements.csv", raw
+        for p in [rootp, rootp.parent]:
+            csv = list(p.rglob("ptbxl_database.csv"))
+            scp = list(p.rglob("scp_statements.csv"))
+            if csv and scp:
+                raw = Path(csv[0]).parent
+                return csv[0], scp[0], raw
+        raise FileNotFoundError("Could not find ptbxl_database.csv / scp_statements.csv under: " + str(root))
 
+def _wfdb_read_lead(base: Union[str, Path], prefer_lead="II") -> Tuple[np.ndarray, int]:
+    base = str(base)
+    if _is_gcs_path(base):
+        gp = Path(base.replace("gs://", ""))
+        rid = gp.name
+        gdir = "gs://" + str(gp.parent).strip("/")
+        local_dir = _ensure_local_record(gdir, rid, exts=["hea", "dat"])
+        base_local = str(local_dir / rid)
+    else:
+        base_local = str(Path(base))
 
-def _ptbxl_paths(root: str|Path):
-    root = Path(root)
-    # Common layouts: <root>/raw/{ptbxl_database.csv, scp_statements.csv}
-    raw = root / "raw"
-    if (raw / "ptbxl_database.csv").exists():
-        return raw / "ptbxl_database.csv", raw / "scp_statements.csv", raw
-    # Fallback: search
-    for p in [root, root.parent]:
-        csv = list(p.rglob("ptbxl_database.csv"))
-        scp = list(p.rglob("scp_statements.csv"))
-        if csv and scp:
-            raw = Path(csv[0]).parent
-            return csv[0], scp[0], raw
-    raise FileNotFoundError("Could not find ptbxl_database.csv / scp_statements.csv under: " + str(root))
-
-
-
-
-
+    rec = wfdb.rdrecord(base_local)
+    fs = int(rec.fs)
+    X = np.asarray(rec.p_signal, dtype=np.float32) if rec.p_signal is not None else np.asarray(rec.d_signal, dtype=np.float32)
+    if isinstance(prefer_lead, int):
+        idx = prefer_lead if prefer_lead < X.shape[1] else 0
+    else:
+        idx = 0
+        try:
+            names = getattr(rec, 'sig_name', []) or []
+            for i, nm in enumerate(names):
+                if str(nm).strip().upper() == str(prefer_lead).strip().upper():
+                    idx = i; break
+        except Exception:
+            pass
+    x = X[:, idx] if X.ndim > 1 else X
+    return x.astype(np.float32), fs
 
 def _ptbxl_labelize(
     df: pd.DataFrame,
@@ -436,20 +514,11 @@ def _ptbxl_labelize(
     task: str = "binary_diag",
     debug: bool = True
 ) -> Tuple[pd.DataFrame, List[int]]:
-    """
-    Build labels for PTB-XL from per-record scp_codes and the scp_statements table.
-
-    task:
-      - "binary_diag": 0 = NORM or no diagnostic code, 1 = any diagnostic non-NORM superclass
-      - "superclass": multiclass over ["NORM","MI","STTC","HYP","CD"]
-    Returns: (df_with_y, classes)
-    """
+    import ast
     if task not in ("binary_diag", "superclass"):
         raise ValueError("task must be 'binary_diag' or 'superclass'")
-
     df = df.copy()
 
-    # 1) parse scp_codes robustly
     def parse_codes(s):
         if isinstance(s, dict):
             return s
@@ -464,23 +533,16 @@ def _ptbxl_labelize(
 
     df["scp_codes_dict"] = df["scp_codes"].apply(parse_codes)
 
-    # 2) normalize scp_df index and build maps (robust even if CSV was read without index_col=0)
     scp_df = scp_df.copy()
-
-    # If codes like 'NORM' are not in the index, assume first column holds codes and set it as index
     idx_upper = set(scp_df.index.astype(str).str.strip().str.upper())
     if "NORM" not in idx_upper and len(scp_df.columns) > 0:
         code_col = scp_df.columns[0]
         scp_df = scp_df.set_index(code_col, drop=True)
-
-    # Clean index to canonical uppercase string codes
     scp_df.index = scp_df.index.astype(str).str.strip().str.upper()
 
-    # Determine superclass column name
     super_col = "superclass" if "superclass" in scp_df.columns else "diagnostic_class"
     code2super = scp_df[super_col].astype(str).str.upper().to_dict()
 
-    # Determine diagnostic mask (some dumps use 0/1, some True/False, some strings)
     if "diagnostic" in scp_df.columns:
         diag_raw = scp_df["diagnostic"]
     else:
@@ -491,10 +553,8 @@ def _ptbxl_labelize(
         | (pd.to_numeric(diag_raw, errors="coerce").fillna(0).astype(float) > 0)
     )
 
-    # Only diagnostic codes whose superclass is not NORM
     diag_codes = {c for c in scp_df.index[diag_mask] if code2super.get(c, "NORM") != "NORM"}
 
-    # 3) per-row label construction
     order = ["NORM", "MI", "STTC", "HYP", "CD"]
     cls_map = {c: i for i, c in enumerate(order)}
     y = []
@@ -506,11 +566,8 @@ def _ptbxl_labelize(
             return 0.0
 
     for d in df["scp_codes_dict"]:
-        # normalize keys to uppercase codes
         dk = {str(k).strip().upper(): v for k, v in (d or {}).items()}
-        # keep only diagnostic, non-NORM statements
         diag_subset = {k: v for k, v in dk.items() if k in diag_codes}
-
         if diag_subset:
             top_code = max(diag_subset.items(), key=lambda kv: _score(kv[1]))[0]
             superc = code2super.get(top_code, "NORM")
@@ -531,28 +588,21 @@ def _ptbxl_labelize(
     classes = [0, 1] if task == "binary_diag" else list(range(len(order)))
     return df, classes
 
-
-
-
 def _pad_crop(x: np.ndarray, L: int):
     if len(x) == L:
         return x
     if len(x) > L:
-        # center-crop
         s = (len(x) - L)//2
         return x[s:s+L]
-    # pad
     out = np.zeros(L, dtype=np.float32)
     s = (L - len(x))//2
     out[s:s+len(x)] = x
     return out
 
-
-
 class PTBXLWindows(Dataset):
-    def __init__(self, df: pd.DataFrame, raw_root: Path, length: int, lead="II", zscore=True):
+    def __init__(self, df: pd.DataFrame, raw_root: Union[str, Path], length: int, lead="II", zscore=True):
         self.df = df.reset_index(drop=True)
-        self.raw_root = raw_root
+        self.raw_root = raw_root if isinstance(raw_root, str) else str(raw_root)
         self.length = int(length)
         self.lead = lead
         self.zscore = zscore
@@ -561,12 +611,12 @@ class PTBXLWindows(Dataset):
 
     def __getitem__(self, i):
         r = self.df.iloc[i]
-        # Use low-res path (100 Hz), PTB-XL stores relative base without extension
-        # e.g., filename_lr="records100/00000/00001/00001"
         base_rel = r["filename_lr"]
-        base = (self.raw_root / base_rel).with_suffix("")  # ensure no extension
+        if _is_gcs_path(self.raw_root):
+            base = _gcs_join(self.raw_root, str(base_rel).lstrip("/"))
+        else:
+            base = str((Path(self.raw_root) / base_rel).with_suffix(""))
         x, fs = _wfdb_read_lead(base, prefer_lead=self.lead)
-        # Basic normalization
         if self.zscore and np.std(x) > 1e-6:
             x = (x - np.mean(x)) / (np.std(x) + 1e-8)
         x = _pad_crop(x, self.length)
@@ -574,10 +624,8 @@ class PTBXLWindows(Dataset):
         y = int(r["y"])
         return torch.from_numpy(x), torch.tensor(y, dtype=torch.long)
 
-
-
 def load_ptbxl_loaders(
-    root: str|Path,
+    root: Union[str, Path],
     batch_size: int = 64,
     length: int = 1800,
     task: str = "binary_diag",
@@ -585,13 +633,11 @@ def load_ptbxl_loaders(
     folds_train=tuple(range(1,9)), fold_val=(9,), fold_test=(10,)
 ):
     db_csv, scp_csv, raw_root = _ptbxl_paths(root)
-    df = pd.read_csv(db_csv)
+    df = pd.read_csv(db_csv)          # gcsfs enables gs:// here
     scp_df = pd.read_csv(scp_csv, index_col=0)
 
-    # labelize
     df, classes = _ptbxl_labelize(df, scp_df, task=task)
 
-    # use recommended stratified folds
     tr = df[df["strat_fold"].isin(folds_train)]
     va = df[df["strat_fold"].isin(fold_val)]
     te = df[df["strat_fold"].isin(fold_test)]
@@ -604,4 +650,3 @@ def load_ptbxl_loaders(
     va_loader = DataLoader(va_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=2, worker_init_fn=_wif)
     te_loader = DataLoader(te_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=2, worker_init_fn=_wif)
     return tr_loader, va_loader, te_loader, {"n_classes": len(set(classes)), "task": task, "lead": lead}
-

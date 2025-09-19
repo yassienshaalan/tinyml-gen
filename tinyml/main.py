@@ -1,13 +1,28 @@
 
 import argparse
 import logging
-import sys
+import sys, os
 from pathlib import Path
-
 from experiments import run_suite, available_datasets, ExpCfg
-from models import MODEL_BUILDERS
 
 LOG_PATH = Path(__file__).parent / "run.log"
+
+class GCSLogHandler(logging.Handler):
+    def __init__(self, gcs_uri: str):
+        super().__init__()
+        try:
+            import gcsfs
+        except Exception:
+            gcsfs = None
+        if gcsfs is None:
+            raise ImportError("gcsfs is required for GCS logging. pip install gcsfs")
+        self.fs = gcsfs.GCSFileSystem(cache_timeout=60)
+        self.gcs_uri = gcs_uri
+
+    def emit(self, record):
+        msg = self.format(record) + "\\n"
+        with self.fs.open(self.gcs_uri, "ab") as f:
+            f.write(msg.encode("utf-8"))
 
 def setup_logging():
     logger = logging.getLogger()
@@ -22,6 +37,19 @@ def setup_logging():
     fh.setLevel(logging.INFO)
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     logger.addHandler(fh)
+
+    results_gcs = os.environ.get("TINYML_RESULTS_GCS")
+    run_ts = os.environ.get("RUN_TS") or __import__("datetime").datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    if results_gcs:
+        gcs_log = results_gcs.rstrip("/") + f"/logs/run_{run_ts}.log"
+        try:
+            gh = GCSLogHandler(gcs_log)
+            gh.setLevel(logging.INFO)
+            gh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+            logger.addHandler(gh)
+            logger.info("GCS logging enabled -> %s", gcs_log)
+        except Exception as e:
+            logger.warning("Could not enable GCS logging: %s", e)
 
 def main():
     setup_logging()
@@ -39,6 +67,7 @@ def main():
     args = parser.parse_args()
 
     logging.info("Available datasets: %s", available_datasets())
+    from models import MODEL_BUILDERS
     logging.info("Available models:   %s", list(MODEL_BUILDERS.keys()))
 
     datasets = available_datasets() if args.dataset == "all" else [args.dataset]
