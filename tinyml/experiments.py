@@ -10437,9 +10437,9 @@ def print_and_log(name, payload):
     print(f"[RESULT] {name} -> {json.dumps(payload, indent=2)[:800]}...")
     save_json(name, payload)
 
-	def _gcsfs():
+def _gcsfs():
     if gcsfs is None:
-        raise ImportError("pip install gcsfs for GCS writing")
+	    raise ImportError("pip install gcsfs for GCS writing")
     return gcsfs.GCSFileSystem(cache_timeout=60)
 
 def _join(root: str, *parts: str) -> str:
