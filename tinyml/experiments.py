@@ -3408,7 +3408,7 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None):
     print("\n" + "="*80)
     print(" UNIFIED TINYML EXPERIMENTS")
     print("="*80)
-	print("total_exp",total_exp)
+    print("total_exp",total_exp)
     print(f" Datasets: {datasets}")
     print(f"  Config: epochs={cfg.epochs}, batch_size={cfg.batch_size}, limit={cfg.limit}, device={cfg.device}")
 
