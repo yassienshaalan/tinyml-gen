@@ -261,32 +261,30 @@ class ApneaECGWindows(Dataset):
 
         for rid in self.records:
 			# ensure local cache of hea/dat/apn and parse header safely
-			base = _record_base_paths(self.root, rid, needed_exts=["hea", "dat", "apn"])
-			try:
-				hdr = wfdb.rdheader(base)  # reads base + ".hea"
-				fs_val = int(round(float(hdr.fs)))
-			except Exception as e:
-				if self.verbose:
-					print(f"[ApneaECGWindows] Skip {rid}: bad or empty header ({e})")
-				continue
+            base = _record_base_paths(self.root, rid, needed_exts=["hea", "dat", "apn"])
+            try:
+            	hdr = wfdb.rdheader(base)  # reads base + ".hea"
+            	fs_val = int(round(float(hdr.fs)))
+            except Exception as e:
+            	if self.verbose:
+            		print(f"[ApneaECGWindows] Skip {rid}: bad or empty header ({e})")
+            	continue
 
-			if fs_val != FS:
-				if self.verbose:
-					print(f"[ApneaECGWindows] Skip {rid}: fs={fs_val} != {FS}")
-				continue
-
-			try:
-				labs = _minute_labels_rdann(self.root, rid)
-			except Exception:
-				labs = []
-			if not labs:
-				if self.verbose: print(f"[ApneaECGWindows] Skip {rid}: no A/N labels in .apn")
-				continue
-
-			self._labs[rid] = labs
-			for m in range(len(labs)):
-				for off in offsets:
-					self.index.append((rid, m, off))
+            if fs_val != FS:
+            	if self.verbose:
+            		print(f"[ApneaECGWindows] Skip {rid}: fs={fs_val} != {FS}")
+            	continue
+            try:
+            	labs = _minute_labels_rdann(self.root, rid)
+            except Exception:
+            	labs = []
+            if not labs:
+            	if self.verbose: print(f"[ApneaECGWindows] Skip {rid}: no A/N labels in .apn")
+            	continue
+            self._labs[rid] = labs
+            for m in range(len(labs)):
+            	for off in offsets:
+            		self.index.append((rid, m, off))
 
         if self.verbose:
             print(f"[ApneaECGWindows] Built {len(self.index)} windows from {len(self._labs)} records.")
