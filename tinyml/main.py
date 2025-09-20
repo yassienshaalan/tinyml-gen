@@ -98,7 +98,7 @@ def main():
     ptbxl_root = _pick_root("PTBXL_ROOT", DL_PTBXL_ROOT)
     mitdb_root = _pick_root("MITDB_ROOT", DL_MITDB_ROOT)
     print("[Roots]", apnea_root, ptbxl_root, mitdb_root)
-    assert not apnea_root.startswith("gs:/"), f"Fix APNEA_ROOT: {apnea_root} -> must be gs://..."
+    #assert not apnea_root.startswith("gs:/"), f"Fix APNEA_ROOT: {apnea_root} -> must be gs://..."
 
     logging.info("[Registry] Available datasets: %s", available_datasets())
     # Start with apnea_ecg only, exactly like your old main
