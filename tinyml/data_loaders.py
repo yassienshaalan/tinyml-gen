@@ -334,6 +334,24 @@ class ApneaECGWindows(Dataset):
         y = torch.tensor(y, dtype=torch.long)
         return x, y
 
+def _make_weighted_sampler_apnea(dataset):
+    """
+    Build per-sample weights inverse to class frequency using the dataset's internal index.
+    """
+    # Count positives/negatives by iterating labels (fast enough)
+    pos = 0; neg = 0
+    y_list = []
+    for (rid, m, off) in dataset.index:
+        y = dataset._labs[rid][m]
+        y_list.append(y)
+        if y == 1: pos += 1
+        else:      neg += 1
+    # Inverse frequency weights
+    w0 = 1.0 / max(1, neg)
+    w1 = 1.0 / max(1, pos)
+    weights = [w1 if y==1 else w0 for y in y_list]
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+	
 def _record_apnea_stats(root: Union[str, Path], records: list[str]):
     stats = []
     for rid in records:
