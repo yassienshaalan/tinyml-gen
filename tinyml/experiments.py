@@ -3408,6 +3408,7 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None):
     print("\n" + "="*80)
     print(" UNIFIED TINYML EXPERIMENTS")
     print("="*80)
+	print("total_exp",total_exp)
     print(f" Datasets: {datasets}")
     print(f"  Config: epochs={cfg.epochs}, batch_size={cfg.batch_size}, limit={cfg.limit}, device={cfg.device}")
 
@@ -4655,7 +4656,12 @@ def deployment_profile(model: nn.Module, meta: dict, flash_bytes_fn=None, device
 import matplotlib.pyplot as plt
 # --- Model name aliases so legacy names work everywhere ---
 
-
+MODEL_ALIASES = {
+    "regcnn": "regular_cnn",
+    "tinysep": "tiny_separable_cnn",
+    "hybrid": "tiny_method",
+    "allsynth": "tiny_method",
+}
 def _normalize_model_name(name: str) -> str:
     n = (name or "").strip().lower()
     return MODEL_ALIASES.get(n, n)
