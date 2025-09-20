@@ -70,14 +70,28 @@ def _gcs_exists(path: str) -> bool:
     except Exception:
         return False
 
-def _gcs_get_file(src: str, dst: Path):
-    """Download a single file from GCS to local dst if not present."""
-    if dst.exists():
+def _gcs_get_file(src: str, dst: Path, *, verify_nonempty: bool = True, retries: int = 1):
+    """Download a single object from GCS to local dst. Verifies non-empty; retries once."""
+    if dst.exists() and dst.stat().st_size > 0:
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
     fs = _gcsfs()
     with fs.open(src, "rb") as fsrc, open(dst, "wb") as fdst:
-        fdst.write(fsrc.read())
+        data = fsrc.read()
+        fdst.write(data)
+
+    if verify_nonempty:
+        lsz = dst.stat().st_size if dst.exists() else 0
+        rsz = _gcs_file_size(src)
+        if lsz == 0 or (rsz is not None and rsz > 0 and lsz == 0):
+            # retry once in case of transient read
+            if retries > 0:
+                try:
+                    dst.unlink()
+                except Exception:
+                    pass
+                return _gcs_get_file(src, dst, verify_nonempty=verify_nonempty, retries=retries - 1)
+            raise IOError(f"Downloaded empty header from GCS: {src}")
 
 def _sanitize_cache_key(gcs_dir: str) -> str:
     # Flatten gs://bucket/path -> bucket_path for a stable local cache dir
@@ -96,13 +110,11 @@ def _ensure_local_record(gcs_dir: str, rid: str, exts: List[str]) -> Path:
     return local_dir
 
 def _record_base_paths(root: Union[str, Path], rid: str, needed_exts: List[str]) -> str:
-    """
-    Return a base path (without extension) that wfdb.* can use.
-    If root is gs://, ensure files are cached locally first.
-    """
     root = str(root)
     if _is_gcs_path(root):
-        local_dir = _ensure_local_record(root, rid, needed_exts)
+        local_dir = DATA_GCS_CACHE / Path(root.replace("gs://", "")).as_posix().replace("/", "_") / rid
+        for ext in needed_exts:
+            _gcs_get_file(_gcs_join(root, f"{rid}.{ext}"), local_dir / f"{rid}.{ext}")
         return str(local_dir / rid)
     else:
         return str(Path(root) / rid)
@@ -248,24 +260,33 @@ class ApneaECGWindows(Dataset):
         offsets = list(range(0, max_start+1, self.stride)) or [0]
 
         for rid in self.records:
-            base = _record_base_paths(self.root, rid, needed_exts=["hea"])
-            hdr = wfdb.rdheader(base)
-            if int(round(hdr.fs)) != FS:
-                if self.verbose: print(f"[ApneaECGWindows] Skip {rid}: fs={hdr.fs} != 100Hz")
-                continue
+			# ensure local cache of hea/dat/apn and parse header safely
+			base = _record_base_paths(self.root, rid, needed_exts=["hea", "dat", "apn"])
+			try:
+				hdr = wfdb.rdheader(base)  # reads base + ".hea"
+				fs_val = int(round(float(hdr.fs)))
+			except Exception as e:
+				if self.verbose:
+					print(f"[ApneaECGWindows] Skip {rid}: bad or empty header ({e})")
+				continue
 
-            try:
-                labs = _minute_labels_rdann(self.root, rid)
-            except Exception:
-                labs = []
-            if not labs:
-                if self.verbose: print(f"[ApneaECGWindows] Skip {rid}: no A/N labels in .apn")
-                continue
-            self._labs[rid] = labs
+			if fs_val != FS:
+				if self.verbose:
+					print(f"[ApneaECGWindows] Skip {rid}: fs={fs_val} != {FS}")
+				continue
 
-            for m in range(len(labs)):
-                for off in offsets:
-                    self.index.append((rid, m, off))
+			try:
+				labs = _minute_labels_rdann(self.root, rid)
+			except Exception:
+				labs = []
+			if not labs:
+				if self.verbose: print(f"[ApneaECGWindows] Skip {rid}: no A/N labels in .apn")
+				continue
+
+			self._labs[rid] = labs
+			for m in range(len(labs)):
+				for off in offsets:
+					self.index.append((rid, m, off))
 
         if self.verbose:
             print(f"[ApneaECGWindows] Built {len(self.index)} windows from {len(self._labs)} records.")
@@ -502,7 +523,15 @@ class MITBIHBeats(Dataset):
             seg = (seg - np.mean(seg)) / (np.std(seg) + 1e-8)
         seg = np.expand_dims(seg.astype(np.float32), 0)
         return torch.from_numpy(seg), torch.tensor(int(y), dtype=torch.long)
-
+def _gcs_file_size(path: str) -> Optional[int]:
+    fs = _gcsfs()
+    try:
+        info = fs.info(path)
+        # gcsfs sometimes returns size under 'size' or 'Size'
+        return int(info.get("size") or info.get("Size") or 0)
+    except Exception:
+        return None
+		
 def _mitbih_records(root: Union[str, Path]) -> List[str]:
     """
     Return MIT-BIH record ids (stems of *.hea). On GCS, avoid recursive walks:
