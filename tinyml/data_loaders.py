@@ -365,6 +365,11 @@ def _record_apnea_stats(root: Union[str, Path], records: list[str]):
 def _records_from_index(ds):
     return sorted({rid for (rid, _, _) in ds.dataset.index})
 
+def _wif(worker_id):
+    s = getattr(cfg, "seed", 42) + worker_id
+    np.random.seed(s)
+    random.seed(s)
+	
 def _stratified_record_split_apnea(root, recs, seed=1337, frac=(0.8, 0.1, 0.1)):
     """
     Record-wise stratified split for Apnea-ECG.
