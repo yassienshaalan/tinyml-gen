@@ -124,30 +124,59 @@ def _list_trainable_records(root: Union[str, Path]) -> List[str]:
     """
     Use only learning-set records that truly have .apn: a**, b**, c**.
     Exclude x** (no labels) and *er variants.
-    Require .dat, .hea, .apn to exist (same folder).
-    Search recursively on GCS and locally.
+    Require .dat, .hea, .apn to exist.
+    GCS: prefer RECORDS manifest, else shallow ls (non-recursive).
     """
     root = str(root)
     recs = set()
+
+    def _keep(rid: str) -> bool:
+        return (rid and rid[0] in ("a","b","c") and not rid.endswith("er"))
+
     if _is_gcs_path(root):
-        for f in _gcs_find(root):  # recursive (handles nested layouts)
-            if not f.endswith(".hea"):
-                continue
-            rid = Path(f).stem
-            if not rid.startswith(("a", "b", "c")) or rid.endswith("er"):
-                continue
-            parent = f.rsplit("/", 1)[0]
-            dat_ok = _gcs_exists(f"{parent}/{rid}.dat")
-            apn_ok = _gcs_exists(f"{parent}/{rid}.apn")
-            if dat_ok and apn_ok:
-                recs.add(rid)
+        fs = _gcsfs()
+
+        # 1) Try the official manifest first (fastest, tiny file)
+        manifest = _gcs_join(root, "RECORDS")
+        try:
+            if fs.exists(manifest):
+                with fs.open(manifest, "rt") as f:
+                    for line in f:
+                        rid = line.strip()
+                        if not rid or rid.startswith("#"):
+                            continue
+                        if _keep(rid):
+                            recs.add(rid)
+        except Exception:
+            # fall back to shallow listing if manifest parse fails
+            pass
+
+        if not recs:
+            # 2) Shallow list only (NO recursion)
+            entries = _gcs_ls(root)
+            # Build extension presence sets from one ls call
+            has_hea = set()
+            has_dat = set()
+            has_apn = set()
+            for p in entries:
+                name = Path(p).name  # e.g., a01.hea
+                stem = Path(p).stem  # e.g., a01
+                suf  = Path(p).suffix.lower()
+                if suf == ".hea": has_hea.add(stem)
+                elif suf == ".dat": has_dat.add(stem)
+                elif suf == ".apn": has_apn.add(stem)
+            # Intersect sets and filter a/b/c, no *er
+            for rid in sorted(has_hea & has_dat & has_apn):
+                if _keep(rid):
+                    recs.add(rid)
+
     else:
+        # Local / mounted FS (recursive okay, but rglob is cheap)
         for hea in Path(root).rglob("*.hea"):
             rid = hea.stem
-            if not rid.startswith(("a","b","c")) or rid.endswith("er"):
-                continue
-            if hea.with_suffix(".dat").exists() and hea.with_suffix(".apn").exists():
+            if _keep(rid) and hea.with_suffix(".dat").exists() and hea.with_suffix(".apn").exists():
                 recs.add(rid)
+
     return sorted(recs)
 
 def _minute_labels_rdann(root: Union[str, Path], rid: str):
@@ -475,15 +504,38 @@ class MITBIHBeats(Dataset):
         return torch.from_numpy(seg), torch.tensor(int(y), dtype=torch.long)
 
 def _mitbih_records(root: Union[str, Path]) -> List[str]:
-    root = str(root)
-    recs = set()
+    """
+    Return MIT-BIH record ids (stems of *.hea). On GCS, avoid recursive walks:
+    - shallow ls() on the root
+    - if none found, ls() each immediate subfolder once (two-level max)
+    """
+    root = _normalize_gs_uri(str(root))
+    recs: set[str] = set()
+
     if _is_gcs_path(root):
-        for f in _gcs_find(root):   # recursive
-            if f.endswith(".hea"):
-                recs.add(Path(f).stem)
+        fs = _gcsfs()
+
+        # 1) Shallow list of the root
+        entries = _gcs_ls(root)  # non-recursive
+        for p in entries:
+            if p.lower().endswith(".hea"):
+                recs.add(Path(p).stem)
+
+        # 2) If nothing found, check immediate subfolders (one extra hop only)
+        if not recs:
+            try:
+                subdirs = [p for p in entries if fs.isdir(p)]
+            except Exception:
+                subdirs = []
+            for d in subdirs:
+                for q in _gcs_ls(d):
+                    if q.lower().endswith(".hea"):
+                        recs.add(Path(q).stem)
     else:
+        # local / mounted: rglob is cheap and safe
         for p in Path(root).rglob("*.hea"):
             recs.add(p.stem)
+
     return sorted(recs)
 
 def load_mitdb_loaders(root: Union[str, Path], batch_size=64, length=1800, binary=True):
