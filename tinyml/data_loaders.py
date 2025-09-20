@@ -16,7 +16,7 @@ try:
     import gcsfs  # pip install gcsfs
 except Exception:
     gcsfs = None
-
+USE_WEIGHTED_SAMPLER = True
 def _is_gcs_path(p: Union[str, Path]) -> bool:
     return str(p).startswith("gs://")
 	
