@@ -5369,12 +5369,6 @@ print("[Paths]")
 print("  APNEA_ROOT:", APNEA_ROOT)
 print("  PTBXL_ROOT:", PTBXL_ROOT)
 print("  MITDB_ROOT:", MITDB_ROOT)
-try:
-    from google.colab import drive
-    drive.mount('/content/drive', force_remount=False)
-    print("[Drive] Mounted")
-except Exception as e:
-    print("[Drive] Skipped mounting:", e)
 
 from pathlib import Path
 
