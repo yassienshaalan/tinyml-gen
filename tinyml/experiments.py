@@ -18,7 +18,7 @@ try:
 except Exception:
     gcsfs = None
 
-from data_loaders import load_apnea_ecg_loaders_impl, APNEA_ROOT as DL_APNEA_ROOT, _normalize_gs_uri
+from data_loaders import load_apnea_ecg_loaders_impl, APNEA_ROOT as DL_APNEA_ROOT, _normalize_gs_uri,_wif
 
 import os, random, numpy as np, wfdb, torch
 from torch.utils.data import Dataset, DataLoader
@@ -5256,10 +5256,7 @@ def seed_everything(s=42):
     import random, numpy as np, torch
     random.seed(s); np.random.seed(s); torch.manual_seed(s)
     torch.cuda.manual_seed_all(s)
-def _wif(worker_id):
-    s = getattr(cfg, "seed", 42) + worker_id
-    np.random.seed(s)
-    random.seed(s)
+
 
 def _dir_has_any(path):
     """Check if directory exists and has files"""
