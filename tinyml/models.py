@@ -22,24 +22,42 @@ MODEL_BUILDERS: Dict[str, Callable] = {}
 MODEL_ALIASES: Dict[str, str] = {}
 
 
+import inspect  # <-- add this near the top with other imports
+
 def _register_model(name: Optional[str] = None):
     """
-    Decorator for nn.Module classes. Registers a builder that tries common __init__ signatures:
-      (in_ch, num_classes, **kwargs) -> (num_classes, **kwargs) -> (**kwargs)
+    Decorator for nn.Module classes. Registers a builder that:
+      - maps common alias kwargs (dz->latent_dim, qbits->quant_bits)
+      - filters unknown kwargs so class __init__ doesn't error
+      - tries handy ctor signatures
     """
     def _wrap(cls):
         key = (name or cls.__name__).lower()
         if key in MODEL_BUILDERS:
             raise ValueError(f"Duplicate model registration for '{key}'")
+
+        def _filter_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+            # Map generic grid kwargs → class-specific names
+            mapping = {
+                "dz": "latent_dim",     # your method uses a single latent size
+                "qbits": "quant_bits",  # common alias
+            }
+            kw = {mapping.get(k, k): v for k, v in kwargs.items()}
+            # Keep only kwargs that the target class __init__ accepts
+            sig = inspect.signature(cls.__init__)
+            allowed = {p.name for p in sig.parameters.values()}
+            return {k: v for k, v in kw.items() if k in allowed}
+
         def _builder(in_ch: int, num_classes: int, **kwargs):
-            # Try progressively simpler signatures for convenience
+            kw = _filter_kwargs(kwargs)
             try:
-                return cls(in_ch=in_ch, num_classes=num_classes, **kwargs)
+                return cls(in_ch=in_ch, num_classes=num_classes, **kw)
             except TypeError:
                 try:
-                    return cls(num_classes=num_classes, **kwargs)
+                    return cls(num_classes=num_classes, **kw)
                 except TypeError:
-                    return cls(**kwargs)
+                    return cls(**kw)
+
         MODEL_BUILDERS[key] = _builder
         return cls
     return _wrap
@@ -545,7 +563,36 @@ class RegularCNN(nn.Module):
         x = x.view(x.size(0), -1)    # (B, 512)
         return self.classifier(x)
 
+@_register_model()		
+class TinyVAEHead(nn.Module):
+    """VAE encoder + linear head (no decoder for inference)"""
+    def __init__(self, in_ch, num_classes, latent_dim=16, base_filters=16):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_ch, base_filters, 3, padding=1)
+        self.conv2 = nn.Conv1d(base_filters, base_filters*2, 3, padding=1)
+        self.pool = nn.AdaptiveAvgPool1d(8)  # reduce to manageable size
+        self.fc_mu = nn.Linear(base_filters*2*8, latent_dim)
+        self.fc_logvar = nn.Linear(base_filters*2*8, latent_dim)
+        self.head = nn.Linear(latent_dim, num_classes)
 
+    def encode(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = self.pool(x).flatten(1)  # (B, C*L)
+        mu = self.fc_mu(x)
+        logvar = self.fc_logvar(x)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.head(z)
+		
 @_register_model()
 class RegularCNN1D(nn.Module):
     """
@@ -750,8 +797,10 @@ class FocalLoss(nn.Module):
 # ============================================================
 
 # names used by experiments/configs → registered class keys
-register_alias("hrv_featnet",       "hrvfeatnet")
-register_alias("cnn3_small",        "cnn1d_3blocks")
-register_alias("resnet1d_small",    "resnet1dsmall")
-register_alias("tiny_separable_cnn","tinyseparablecnn")
-register_alias("regular_cnn",       "regularcnn1d")
+register_alias("tiny_method",        "sharedcoreseparable1d")  # or "tinymethodmodel" if you prefer that core
+register_alias("tiny_vae_head",      "tinyvaehead")            # wrapper below
+register_alias("cnn3_small",         "cnn1d_3blocks")
+register_alias("resnet1d_small",     "resnet1dsmall")
+register_alias("tiny_separable_cnn", "tinyseparablecnn")
+register_alias("regular_cnn",        "regularcnn1d")
+register_alias("hrv_featnet",        "hrvfeatnet")
