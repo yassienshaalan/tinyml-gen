@@ -3421,7 +3421,101 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None):
     print(" Saved: comprehensive_tinyml_results.csv")
     return df
 
-# -------------------- Quick Test & Utility Functions ----------------
+def _destinations():
+    """
+    Decide where to write:
+      - Local:  TINYML_RESULTS_LOCAL  (default: ./results)
+                OR (if set) TINYML_RESULTS_DIR when it's a non-gs path
+      - GCS:    TINYML_RESULTS_GCS
+                OR (if set) TINYML_RESULTS_DIR when it's a gs:// path
+
+    You can set both env vars, or just set TINYML_RESULTS_DIR to gs:// and
+    we'll still keep a local copy under ./results by default.
+    """
+    env_dir  = os.environ.get("TINYML_RESULTS_DIR")     # may be local OR gs://
+    env_gcs  = os.environ.get("TINYML_RESULTS_GCS")     # gs:// preferred
+    env_loc  = os.environ.get("TINYML_RESULTS_LOCAL","/home/yassien/tinyml-gen/tinyml/results")   
+    # Defaults
+    local_root = Path(env_loc or "./results")
+    gcs_root   = None
+
+    if env_dir:
+        if _is_gcs_path(env_dir):
+            gcs_root = env_dir.rstrip("/")
+        else:
+            local_root = Path(env_dir)
+
+    if env_gcs:
+        gcs_root = env_gcs.rstrip("/")
+
+    # Ensure local exists
+    local_root.mkdir(parents=True, exist_ok=True)
+    return local_root, gcs_root
+
+def save_df_both(df, filename: str, subdir: str | None = None):
+    """
+    Save a DataFrame to BOTH local and (optionally) GCS.
+    - Never raises on GCS failure; logs a warning instead.
+    - Returns a dict with 'local' (always) and 'gcs' or 'gcs_error'.
+    """
+    local_root, gcs_root = _destinations()
+    out = {}
+
+    # -- Local (always) --
+    loc_dir = local_root / subdir if subdir else local_root
+    loc_dir.mkdir(parents=True, exist_ok=True)
+    loc_path = (loc_dir / filename).as_posix()
+    df.to_csv(loc_path, index=False)
+    print(f"[save] local -> {loc_path}")
+    out["local"] = loc_path
+
+    # -- GCS (best-effort) --
+    if gcs_root:
+        gcs_path = None
+        try:
+            fs = _gcsfs_handle()  # may raise if gcsfs not installed or ADC not set
+            gprefix = gcs_root + ("/" + subdir.strip("/") if subdir else "")
+            gcs_path = f"{gprefix}/{filename}"
+            payload = df.to_csv(index=False).encode("utf-8")
+            with fs.open(gcs_path, "wb") as f:
+                f.write(payload)
+            print(f"[save] gcs   -> {gcs_path}")
+            out["gcs"] = gcs_path
+        except Exception as e:
+            # Do not fail the run; just log a warning and continue
+            where = gcs_path if gcs_path else (gcs_root + "/" + filename)
+            print(f"[save][warn] failed to write to GCS: {where} | {type(e).__name__}: {e}")
+            out["gcs_error"] = f"{type(e).__name__}: {e}"
+
+    return out
+
+
+# Backwards-compatible wrapper (so you don't have to touch other call sites)
+def save_df_to_drive(df, filename, subdir=None):
+    return save_df_both(df, filename, subdir=subdir)
+
+# If you also save raw bytes or JSON elsewhere, you can mirror with helpers like:
+def save_bytes_both(payload: bytes, filename: str, subdir: str | None = None):
+    local_root, gcs_root = _destinations()
+    out = {}
+    # local
+    loc_dir = local_root / subdir if subdir else local_root
+    loc_dir.mkdir(parents=True, exist_ok=True)
+    loc_path = (loc_dir / filename).as_posix()
+    with open(loc_path, "wb") as f:
+        f.write(payload)
+    print(f"[save] local -> {loc_path}")
+    out["local"] = loc_path
+    # gcs
+    if gcs_root:
+        fs = _gcsfs_handle()
+        gprefix = gcs_root + ("/" + subdir.strip("/") if subdir else "")
+        gcs_path = f"{gprefix}/{filename}"
+        with fs.open(gcs_path, "wb") as f:
+            f.write(payload)
+        print(f"[save] gcs   -> {gcs_path}")
+        out["gcs"] = gcs_path
+    return out
 def quick_test():
     """Run a quick test with minimal config to verify everything works"""
     print(" Running quick test...")
@@ -5954,11 +6048,6 @@ def build_tiny_separable_cnn(base_channels=24, num_classes=2, latent_dim=16, inp
         input_length=input_length
     )
 
-
-
-
-
-
 def _ensure_drive_mounted():
     try:
         from google.colab import drive
@@ -5967,7 +6056,7 @@ def _ensure_drive_mounted():
     except Exception:
         pass  # on non-Colab, ignore
 
-
+'''
 def save_df_to_drive(df, filename, subdir=None):
     root = _results_dir()
     if subdir:
@@ -5977,11 +6066,7 @@ def save_df_to_drive(df, filename, subdir=None):
     print(f" Saved: {out.as_posix()}")
     return out
 
-
-# Cell A — Lightweight ECG training augments (helps generalization without changing model size)
-import torch
-import numpy as np
-
+'''
 
 def _results_dir(prefer="MyDrive/tinyml_hyper_tiny_baselines/results"):
     _ensure_drive_mounted()
