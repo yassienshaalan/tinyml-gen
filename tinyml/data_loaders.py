@@ -6,7 +6,12 @@ from typing import Tuple, List, Optional, Union
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+try:
+    from torch.utils.data import ConcatDataset, Subset, random_split, RandomSampler, WeightedRandomSampler
+except Exception:
+    # fallback for very old torch versions
+    from torch.utils.data.dataset import ConcatDataset, Subset
+    from torch.utils.data import random_split, RandomSampler, WeightedRandomSampler
 import wfdb
 import re 
 # =============================
