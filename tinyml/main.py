@@ -3,14 +3,56 @@
 import os, sys, logging
 from pathlib import Path
 
-# --- logging: screen + run.log next to main ---
-LOG_PATH = Path(__file__).parent / "run.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout),
-              logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")],
-)
+import sys, os, atexit, datetime
+
+def _open_logfile(base_dir="logs", prefix="run"):
+    os.makedirs(base_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(base_dir, f"{prefix}-{ts}.log")
+    # line-buffered text mode for timely writes
+    f = open(path, "a", buffering=1, encoding="utf-8")
+    f.write(f"=== START {ts} ===\n")
+    return f, path
+
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+        self.flush()
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+    def isatty(self):
+        # Pretend to be a tty if any underlying stream is a tty
+        return any(getattr(s, "isatty", lambda: False)() for s in self._streams)
+
+# Create logfile and tee both stdout and stderr
+_log_fp, LOG_PATH = _open_logfile(base_dir=os.environ.get("LOG_DIR", "logs"),
+                                  prefix=os.environ.get("LOG_PREFIX", "run"))
+_original_stdout, _original_stderr = sys.stdout, sys.stderr
+sys.stdout = _Tee(sys.stdout, _log_fp)
+sys.stderr = _Tee(sys.stderr, _log_fp)
+
+@atexit.register
+def _close_log():
+    try:
+        sys.stdout.flush(); sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        _log_fp.write("=== END ===\n"); _log_fp.flush(); _log_fp.close()
+    except Exception:
+        pass
+
+print(f"[logging] Mirroring prints to: {LOG_PATH}")
 logging.info("Starting TinyML main")
 
 # --- framework hooks from experiments (no side-effect registration here) ---
