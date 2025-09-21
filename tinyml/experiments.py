@@ -6005,28 +6005,7 @@ def save_df_to_drive(df, filename, subdir=None):
     print(f" Saved: {out.as_posix()}")
     return out
 
-def print_class_distribution(loader, name="", fast_limit=2000):
-    ds = loader.dataset
-    labels = _extract_labels_fast(ds)
-    if labels is None:
-        counts = Counter(); seen=0; limit = float("inf") if fast_limit is None else int(fast_limit)
-        for _, y in loader:
-            y = y.detach().cpu().tolist() if isinstance(y, torch.Tensor) else list(map(int, y))
-            for yy in y:
-                counts[int(yy)] += 1; seen += 1
-                if seen >= limit: break
-            if seen >= limit: break
-        total = sum(counts.values()); approx = "" if fast_limit is None else " (approx)"
-        print(f"\n=== {name} class distribution{approx} ===")
-        print(f"  counted samples : {total}  (limit={fast_limit})")
-        for cls in sorted(counts): print(f"  class {cls}: {counts[cls]} ({counts[cls]/max(1,total):.2%})")
-        print("="*40)
-        return
-    counts = Counter(map(int, labels)); total = sum(counts.values())
-    print(f"\n=== {name} class distribution ===")
-    print(f"  total samples : {total}")
-    for cls in sorted(counts): print(f"  class {cls}: {counts[cls]} ({counts[cls]/total:.2%})")
-    print("="*40)
+
 # Cell A — Lightweight ECG training augments (helps generalization without changing model size)
 import torch
 import numpy as np
@@ -10087,7 +10066,7 @@ def df_to_latex_table(df, caption="TinyML Results (LEAN)", label="tab:tinyml_lea
 from models import safe_build_model, MODEL_BUILDERS
 from data_loaders import (
     APNEA_ROOT, PTBXL_ROOT, MITDB_ROOT,
-    load_apnea_ecg_loaders_impl, load_ptbxl_loaders, load_mitdb_loaders
+    load_apnea_ecg_loaders_impl, load_ptbxl_loaders, load_mitdb_loaders,print_class_distribution
 )
 
 def available_datasets() -> list:
