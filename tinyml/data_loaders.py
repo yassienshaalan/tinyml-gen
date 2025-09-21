@@ -471,6 +471,37 @@ def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, v
         raise RuntimeError("No windows built. Check .apn presence and that length < 6000.")
 
     return dl_tr, dl_va, dl_te
+
+def _extract_labels_fast(ds):
+    for attr in ("targets","labels","y"):
+        if hasattr(ds, attr):
+            v = getattr(ds, attr)
+            if isinstance(v, torch.Tensor): return v.detach().cpu().tolist()
+            try: return list(map(int, list(v)))
+            except: pass
+    if hasattr(ds, "df") and hasattr(ds.df, "__getitem__"):
+        for col in ("label","y","target","class"):
+            if col in ds.df.columns:
+                return list(map(int, ds.df[col].tolist()))
+    if hasattr(ds, "metadata") and isinstance(ds.metadata, dict):
+        for k in ("labels","y","targets"):
+            if k in ds.metadata:
+                v = ds.metadata[k]
+                if isinstance(v, torch.Tensor): return v.detach().cpu().tolist()
+                try: return list(map(int, list(v)))
+                except: pass
+    if isinstance(ds, Subset):
+        base = ds.dataset; base_labels = _extract_labels_fast(base)
+        if base_labels is not None:
+            return [int(base_labels[i]) for i in ds.indices]
+    if isinstance(ds, ConcatDataset):
+        out=[]
+        for child in ds.datasets:
+            lbls = _extract_labels_fast(child)
+            if lbls is None: return None
+            out.extend(lbls)
+        return out
+    return None
 	
 def print_class_distribution(loader, name="", fast_limit=2000):
     ds = loader.dataset
