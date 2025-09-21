@@ -17,7 +17,7 @@ try:
     import gcsfs
 except Exception:
     gcsfs = None
-
+import matplotlib.pyplot as plt
 from data_loaders import load_apnea_ecg_loaders_impl, APNEA_ROOT as DL_APNEA_ROOT, _normalize_gs_uri,_wif
 
 import os, random, numpy as np, wfdb, torch
@@ -4585,14 +4585,15 @@ def deployment_profile(model: nn.Module, meta: dict, flash_bytes_fn=None, device
         "energy_mJ": energy_mJ,
     }
 
-import matplotlib.pyplot as plt
-# --- Model name aliases so legacy names work everywhere ---
 
 MODEL_ALIASES = {
-    "regcnn": "regular_cnn",
-    "tinysep": "tiny_separable_cnn",
-    "hybrid": "tiny_method",
-    "allsynth": "tiny_method",
+    "hrv_featnet": "hrvfeatnet",          # if/when HRVFeatNet exists
+    "cnn3_small": "tinyseparablecnn",     # or whatever you intend “cnn3_small” to mean
+    "resnet1d_small": "resnet1dsmall",    # if you add a ResNet1DSmall class
+    "tiny_separable_cnn": "tinyseparablecnn",
+    "tiny_vae_head": "tinyvaehead",
+    "regular_cnn": "regularcnn1d",
+    "tiny_method": "tinymethodmodel",
 }
 def _normalize_model_name(name: str) -> str:
     n = (name or "").strip().lower()

@@ -5,6 +5,8 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from typing import Callable, Dict
 @_register_model
 
 class RegularCNN1D(nn.Module):
@@ -1010,39 +1012,42 @@ class ResNet1DSmall(nn.Module):
 # === Model registry ===
 MODEL_BUILDERS = {}
 
-def _register_model(cls):
-    """Decorator to add a model class to MODEL_BUILDERS by name (lowercase)."""
-    name = cls.__name__
-    key = name.lower()
-    # default builder that forwards kwargs but filters unknown args if constructor is strict
-    def builder(in_ch: int, num_classes: int, **kwargs):
-        import inspect
-        sig = inspect.signature(cls.__init__)
-        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-        if has_varkw:
-            return cls(in_ch, num_classes, **kwargs)
-        # keep only ctor-supported kwargs
-        allowed = set(sig.parameters.keys())
-        filtered = {k: v for k, v in kwargs.items() if k in allowed}
-        try:
-            return cls(in_ch, num_classes, **filtered)
-        except TypeError:
-            # greedy inclusion
-            accepted = {}
-            for k, v in filtered.items():
+def _register_model(name: str | None = None):
+    """
+    Decorator for nn.Module classes. Registers a builder that tries a few common __init__ signatures:
+      1) (in_ch, num_classes, **kwargs)
+      2) (num_classes, **kwargs)
+      3) (**kwargs)
+    and stores it in MODEL_BUILDERS under `name` or class.__name__.lower().
+    """
+    def _wrap(cls):
+        key = (name or cls.__name__).lower()
+        if key in MODEL_BUILDERS:
+            raise ValueError(f"Duplicate model registration for '{key}'")
+        def _builder(in_ch: int, num_classes: int, **kwargs):
+            try:
+                return cls(in_ch=in_ch, num_classes=num_classes, **kwargs)
+            except TypeError:
                 try:
-                    _ = cls(in_ch, num_classes, **accepted, **{k: v})
-                    accepted[k] = v
+                    return cls(num_classes=num_classes, **kwargs)
                 except TypeError:
-                    continue
-            return cls(in_ch, num_classes, **accepted)
+                    return cls(**kwargs)
+        MODEL_BUILDERS[key] = _builder
+        return cls
+    return _wrap
 
-    # prefer last-writer-wins to allow overrides
-    MODEL_BUILDERS[key] = builder
-    return cls
+
+def register_alias(alias: str, target: str):
+    """Map a friendly alias to a registered key (both compared in lower-case)."""
+    MODEL_ALIASES[alias.lower()] = target.lower()
 
 def safe_build_model(model_name: str, in_ch: int, num_classes: int, **model_kwargs):
-    key = model_name.lower()
+    """
+    Resolve alias -> key, look up builder, and instantiate.
+    Raises a clear error listing available names if not found.
+    """
+    key = MODEL_ALIASES.get(model_name.lower(), model_name.lower())
     if key not in MODEL_BUILDERS:
-        raise KeyError(f"Model '{model_name}' not registered. Available: {list(MODEL_BUILDERS.keys())}")
+        avail = sorted(MODEL_BUILDERS.keys())
+        raise KeyError(f"Model '{model_name}' not registered. Available: {avail}")
     return MODEL_BUILDERS[key](in_ch, num_classes, **model_kwargs)
