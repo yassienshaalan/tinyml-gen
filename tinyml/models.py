@@ -5,6 +5,7 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+@_register_model
 
 class RegularCNN1D(nn.Module):
     def __init__(self, in_ch=1, num_classes=2, **kw):
@@ -18,7 +19,7 @@ class RegularCNN1D(nn.Module):
     def forward(self, x): return self.core(x)
 
 
-
+@_register_model
 class TinySep1D(nn.Module):
     def __init__(self, in_ch=1, num_classes=2, **kw):
         super().__init__()
@@ -28,7 +29,7 @@ class TinySep1D(nn.Module):
     def forward(self, x): return self.core(x)
 
 
-
+@_register_model
 class HypertinyHybrid(nn.Module):
     def __init__(self, dz=4, dh=12, in_ch=1, num_classes=2, base=16, latent_dim=16, input_length=1800, **kw):
         super().__init__()
@@ -46,7 +47,7 @@ class HypertinyHybrid(nn.Module):
     def forward(self, x): return self.core(x)
 
 
-
+@_register_model
 class HypertinyAllSynth(nn.Module):
     def __init__(self, dz=6, dh=16, in_ch=1, num_classes=2, base=16, latent_dim=16, input_length=1800, **kw):
         super().__init__()
@@ -62,7 +63,7 @@ class HypertinyAllSynth(nn.Module):
 
 # Minimal VAE encoder+head so TinyVAEHead exists if needed
 
-
+@_register_model
 class VAE1D_Enc(nn.Module):
     def __init__(self, in_ch=1, base=16, latent_dim=16, input_length=1800, **kw):
         super().__init__()
@@ -75,7 +76,7 @@ class VAE1D_Enc(nn.Module):
         return mu, logvar
 
 
-
+@_register_model
 class TinyVAEHead(nn.Module):
     """Simple VAE encoder + linear head so the name exists for both suites."""
     def __init__(self, in_ch=1, num_classes=2, z=16, base=16, input_length=1800, **kw):
@@ -87,9 +88,6 @@ class TinyVAEHead(nn.Module):
         std = (0.5*logvar).exp().clamp_min(1e-3)
         z = mu + torch.randn_like(std) * std
         return self.head(z)
- #==================================Just Extra remove later
- #'''
-
 
 class SafeFocalLoss(nn.Module):
     """
@@ -142,8 +140,6 @@ class LabelSmoothingCrossEntropy(nn.Module):
         loss = confidence * nll_loss + self.smoothing * smooth_loss
         return loss.mean()
 
-
-
 class FocalLoss(nn.Module):
     def __init__(self, gamma=1.5, alpha=None, reduction="mean"):
         super().__init__()
@@ -163,8 +159,7 @@ class FocalLoss(nn.Module):
             loss = alpha_vec[target] * loss
         return loss.mean() if self.reduction == "mean" else loss.sum()
 
-
-
+@_register_model
 class SqueezeExcite1D(nn.Module):
     """Lightweight SE block for 1D signals - improves feature selection"""
     def __init__(self, channels, reduction=4):
@@ -182,7 +177,7 @@ class SqueezeExcite1D(nn.Module):
         return x * self.se(x)
 
 
-
+@_register_model
 class DepthwiseSeparable1D(nn.Module):
     def __init__(self, in_ch, out_ch, k=5, stride=1, padding=None, use_se=True, use_residual=True):
         super().__init__()
@@ -430,9 +425,7 @@ class SharedCoreSeparable1D(nn.Module):
             total += (p.numel() * 4 + 7)//8
         return {"boot": 1954, "lazy": total}
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
 
 
 class SafeFocalLoss(nn.Module):
