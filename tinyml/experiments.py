@@ -8230,15 +8230,20 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
 
 
 
+from itertools import product
+
 def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None):
     # Datasets to run
     if datasets is None:
         datasets = [d for d in available_datasets()]
 
+    # Build full spec list once
     all_specs = []
     for ds in datasets:
-        if ds not in available_datasets(): continue
-        for spec in build_model_grid_for_dataset(ds):
+        if ds not in available_datasets():
+            continue
+        grid = build_model_grid_for_dataset(ds)   # <-- uses the function below
+        for spec in grid:
             all_specs.append((ds, spec))
     total_exp = len(all_specs)
 
@@ -8247,8 +8252,9 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None):
     print("="*80)
     print(f" Datasets: {datasets}")
     print(f"  Config: epochs={cfg.epochs}, batch_size={cfg.batch_size}, limit={cfg.limit}, device={cfg.device}")
+    print(f"  Planned experiments: {total_exp}")
 
-    # Build one size table (probe first available dataset)
+    # Optional: size table for the first dataset (best-effort)
     if datasets:
         try:
             df_size = build_size_table_one_dataset(datasets[0], cfg)
@@ -8256,47 +8262,37 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None):
             print(f"[WARN] Size table failed: {e}")
 
     all_results = []
-    total = 0
-    for ds in datasets:
-        if ds not in available_datasets():
-            print(f"  Skipping unavailable dataset: {ds}")
-            continue
-        grid = build_model_grid_for_dataset(ds)
-        total += len(grid)
-
-        #for spec in grid:
-        for i, (ds, spec) in enumerate(all_specs, start=1):
-            name   = spec['name']
-            kwargs = spec.get('kwargs', {})
-            kd     = spec.get('kd', False)
-            exp_id = make_exp_id(i, total_exp, ds, _normalize_model_name(name), kd, kwargs, seed=getattr(cfg, 'seed', None))
-            print(f"\n📍 {exp_id}")
-            try:
-                #res = run_experiment_unified(cfg, ds, name, model_kwargs=kwargs, kd=kd,
-                #                            w_size=1.0, w_bit=(0.05 if kd else 0.0),
-                 #w_spec=1e-4, w_softf1=0.10)
-                dl_tr, dl_va, dl_te, meta = get_or_make_loaders_once(ds, cfg)
-                print("Before printing ",dl_tr, dl_va, dl_te, meta)
-                print_class_dist_from_loaders(dl_tr, dl_va, dl_te, meta)
-                # pass these into run_experiment_unified instead of rebuilding
-                res = run_experiment_unified(cfg, ds, name, model_kwargs=kwargs, kd=kd,
-                                            loaders=(dl_tr, dl_va, dl_te, meta),
-                                            w_size=1.0, w_bit=(0.05 if kd else 0.0),
-                                            w_spec=1e-4, w_softf1=0.10)
-                if res:
-                    res['exp_id'] = exp_id         # <- keep ID in the row
-                    res['exp_name'] = f"{ds}+{name}"
-                    all_results.append(res)
-            except Exception as e:
-                print(f"💥 {exp_id} failed: {e}")
-                import traceback; traceback.print_exc()
+    for i, (ds_name, spec) in enumerate(all_specs, start=1):
+        name   = spec['name']
+        kwargs = spec.get('kwargs', {})
+        kd     = spec.get('kd', False)
+        exp_id = make_exp_id(i, total_exp, ds_name, _normalize_model_name(name), kd, kwargs, seed=getattr(cfg, 'seed', None))
+        print(f"\n📍 {exp_id}")
+        try:
+            dl_tr, dl_va, dl_te, meta = get_or_make_loaders_once(ds_name, cfg)
+            print_class_dist_from_loaders(dl_tr, dl_va, dl_te, meta)
+            res = run_experiment_unified(
+                cfg, ds_name, name, model_kwargs=kwargs, kd=kd,
+                loaders=(dl_tr, dl_va, dl_te, meta),
+                # loss weights consistent with your current defaults:
+                w_size=1.0, w_bit=(0.05 if kd else 0.0),
+                w_spec=1e-4, w_softf1=0.10
+            )
+            if res:
+                res['exp_id']   = exp_id
+                res['exp_name'] = f"{ds_name}+{name}"
+                all_results.append(res)
+        except Exception as e:
+            print(f"💥 {exp_id} failed: {e}")
+            import traceback; traceback.print_exc()
 
     if not all_results:
         print("No experiments completed successfully")
         return None
 
     df = pd.DataFrame(all_results).sort_values('exp_id')
-    # Pareto + summaries
+
+    # Pareto + summaries (best-effort)
     try:
         pf = plot_pareto(df, x='flash_kb', y='test_f1_at_t', save_path='pareto_accuracy_vs_flash.png')
         print("\nPARETO FRONTIER (non-dominated points):")
@@ -8307,24 +8303,21 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None):
     print(f"\n{'='*80}")
     print(" EXPERIMENT RESULTS SUMMARY")
     print("="*80)
-    print(f" Completed runs: {len(all_results)}/{total}")
+    print(f" Completed runs: {len(all_results)}/{total_exp}")
     if 'val_acc' in df:
         print(f"📈 Avg val acc: {df['val_acc'].mean():.4f} ± {df['val_acc'].std():.4f}")
     if 'flash_kb' in df:
         print(f" Avg model flash: {df['flash_kb'].mean():.1f} KB")
 
-    # Compact table
     cols = ['dataset','model','kd','model_kwargs','val_acc','test_acc','val_f1_at_t','test_f1_at_t',
             'flash_kb','params','macs','latency_ms','energy_mJ','train_time_s']
     cols = [c for c in cols if c in df.columns]
     print("\nRESULTS TABLE")
     print(df[cols].to_string(index=False, float_format='%.4f'))
 
-    # Save
     save_df_to_drive(df, 'comprehensive_tinyml_results.csv')
     print(" Saved: comprehensive_tinyml_results.csv")
     return df
-
 # -------------------- Quick Test & Utility Functions ----------------
 
 def quick_test():
@@ -9710,7 +9703,7 @@ def plot_pareto(df: pd.DataFrame, x='flash_kb', y='test_f1_at_t', save_path='par
     return pf
 
 # ---------- Build unified model grid (incl. ablations & KD variants) ----------
-
+'''
 def build_model_grid_for_dataset(ds_key: str):
     grid = []
     # Core baselines
@@ -9733,7 +9726,115 @@ def build_model_grid_for_dataset(ds_key: str):
     ]
     grid += kd_variants
     return grid
+'''
+def build_model_grid_for_dataset(ds: str):
+    """
+    Returns a list of dict specs: {'name': <model>, 'kwargs': {...}, 'kd': bool}
+    We expand all the combinations needed to mirror the paper + your stronger baselines.
+    """
+    grid = []
 
+    # Global toggles / sweeps
+    kd_opts       = [False, True]
+    focal_opts    = [False, True]          # If your trainer reads this; else safely ignored
+    qbit_opts     = [8, 6, 4]              # Quantization bit-widths for packed flash (adjust names if needed)
+
+    # ---- Method variants (your proposed model)
+    # Latent sizes typically used in paper ablations
+    latent_pairs  = [(4, 12), (6, 16)]     # (dz, dh)
+    for (dz, dh), kd, focal, qbits in product(latent_pairs, kd_opts, focal_opts, qbit_opts):
+        grid.append({
+            'name': 'tiny_method',
+            'kd': kd,
+            'kwargs': {
+                # If your method class expects these names, great; otherwise rename:
+                'dz': dz, 'dh': dh,
+                'use_focal': focal,
+                # Quantization knobs (rename to match your estimator / model if needed):
+                'quant_bits': qbits,        # <- change to 'qbits_pw'/'qbits_head' if your code expects that
+                'qbits': qbits,
+            }
+        })
+
+    # ---- VAE-head baseline
+    for kd, focal, qbits in product(kd_opts, focal_opts, qbit_opts):
+        grid.append({
+            'name': 'tiny_vae_head',
+            'kd': kd,
+            'kwargs': {
+                'use_focal': focal,
+                'quant_bits': qbits,
+                'qbits': qbits,
+            }
+        })
+
+    # ---- Compact CNN (3 blocks)
+    for kd, focal, qbits in product(kd_opts, focal_opts, qbit_opts):
+        grid.append({
+            'name': 'cnn3_small',
+            'kd': kd,
+            'kwargs': {
+                'base': 16,                 # bump to 24 if you want a stronger baseline
+                'use_focal': focal,
+                'quant_bits': qbits,
+                'qbits': qbits,
+            }
+        })
+
+    # ---- ResNet small
+    for kd, focal, qbits in product(kd_opts, focal_opts, qbit_opts):
+        grid.append({
+            'name': 'resnet1d_small',
+            'kd': kd,
+            'kwargs': {
+                'base': 16,
+                'use_focal': focal,
+                'quant_bits': qbits,
+                'qbits': qbits,
+            }
+        })
+
+    # ---- Tiny separable CNN
+    for kd, focal, qbits in product(kd_opts, focal_opts, qbit_opts):
+        grid.append({
+            'name': 'tiny_separable_cnn',
+            'kd': kd,
+            'kwargs': {
+                'base_filters': 16,
+                'n_blocks': 2,
+                'use_focal': focal,
+                'quant_bits': qbits,
+                'qbits': qbits,
+            }
+        })
+
+    # ---- Regular CNN (reference, larger)
+    for kd, focal, qbits in product(kd_opts, focal_opts, qbit_opts):
+        grid.append({
+            'name': 'regular_cnn',
+            'kd': kd,
+            'kwargs': {
+                'use_focal': focal,
+                'quant_bits': qbits,
+                'qbits': qbits,
+            }
+        })
+
+    # ---- HRV feature + linear head (tiny baseline)
+    for kd, focal in product(kd_opts, focal_opts):
+        grid.append({
+            'name': 'hrv_featnet',
+            'kd': kd,
+            'kwargs': {
+                'fs': 100.0,
+                'use_focal': focal,
+                # usually quantization is negligible here; leave bits out or set qbits=8
+            }
+        })
+
+    # You can also filter by dataset if some models don't apply (e.g., multi-lead vs single-lead)
+    return grid
+	
 
 def resource_penalty(model: nn.Module, meta: dict, w_size: float = 0.0, w_macs: float = 0.0):
     # L1 on learnable params (encourages sparsity / smaller effective size)

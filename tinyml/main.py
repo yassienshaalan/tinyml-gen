@@ -111,8 +111,8 @@ def _mitdb_gcs_wrapper(batch_size=64, length=1800, binary=True, **_):
 register_dataset('apnea_ecg', _apnea_gcs_wrapper)
 
 # Flip these to True if you want them in this run
-REGISTER_PTB = True
-REGISTER_MIT = True
+REGISTER_PTB = False
+REGISTER_MIT = False
 if REGISTER_PTB:
     register_dataset('ptbxl', _ptbxl_gcs_wrapper)
 if REGISTER_MIT:
