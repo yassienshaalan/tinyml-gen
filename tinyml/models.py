@@ -1,167 +1,130 @@
+# models.py (VM-ready)
+# ------------------------------------------------------------
+# - Fixes: NameError for @_register_model, empty MODEL_BUILDERS
+# - Removes duplicate classes, adds helpers used by cores
+# - Registers models + sets aliases so experiment names resolve
+# ------------------------------------------------------------
 
 import math, os, json, random
-from typing import Any, Dict
+from typing import Any, Dict, Callable, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Callable, Dict
-@_register_model
 
-class RegularCNN1D(nn.Module):
-    def __init__(self, in_ch=1, num_classes=2, **kw):
-        super().__init__()
-        if 'RegularCNN' in globals():
-            self.core = RegularCNN(in_ch, num_classes, **kw)
-        else:
-            # fallback to your shared core if RegularCNN isn’t present
-            self.core = SharedCoreSeparable1D(in_ch=in_ch, base=32, num_classes=num_classes,
-                                              latent_dim=16, input_length=kw.get('input_length', 1800))
-    def forward(self, x): return self.core(x)
+# ============================================================
+# Model Registry (define FIRST so decorators exist)
+# ============================================================
+
+MODEL_BUILDERS: Dict[str, Callable] = {}
+MODEL_ALIASES: Dict[str, str] = {}
 
 
-@_register_model
-class TinySep1D(nn.Module):
-    def __init__(self, in_ch=1, num_classes=2, **kw):
-        super().__init__()
-        self.core = TinySeparableCNN(in_ch, num_classes, **kw) if 'TinySeparableCNN' in globals() \
-                    else SharedCoreSeparable1D(in_ch=in_ch, base=16, num_classes=num_classes,
-                                               latent_dim=16, input_length=kw.get('input_length', 1800))
-    def forward(self, x): return self.core(x)
-
-
-@_register_model
-class HypertinyHybrid(nn.Module):
-    def __init__(self, dz=4, dh=12, in_ch=1, num_classes=2, base=16, latent_dim=16, input_length=1800, **kw):
-        super().__init__()
-        if 'build_hypertiny_hybrid' in globals():
-            self.core = build_hypertiny_hybrid()
-        elif 'TinyMethodModel' in globals():
+def _register_model(name: Optional[str] = None):
+    """
+    Decorator for nn.Module classes. Registers a builder that tries common __init__ signatures:
+      (in_ch, num_classes, **kwargs) -> (num_classes, **kwargs) -> (**kwargs)
+    """
+    def _wrap(cls):
+        key = (name or cls.__name__).lower()
+        if key in MODEL_BUILDERS:
+            raise ValueError(f"Duplicate model registration for '{key}'")
+        def _builder(in_ch: int, num_classes: int, **kwargs):
+            # Try progressively simpler signatures for convenience
             try:
-                self.core = TinyMethodModel(in_ch, num_classes, keep_first_pw=True)
+                return cls(in_ch=in_ch, num_classes=num_classes, **kwargs)
             except TypeError:
-                self.core = TinyMethodModel(in_ch, num_classes)
-        else:
-            self.core = SharedCoreSeparable1D(in_ch=in_ch, base=base, num_classes=num_classes,
-                                              latent_dim=latent_dim, input_length=input_length, hybrid_keep=1)
-        self._synth_cfg = {"dz": dz, "dh": dh, "mode": "hybrid"}
-    def forward(self, x): return self.core(x)
+                try:
+                    return cls(num_classes=num_classes, **kwargs)
+                except TypeError:
+                    return cls(**kwargs)
+        MODEL_BUILDERS[key] = _builder
+        return cls
+    return _wrap
 
 
-@_register_model
-class HypertinyAllSynth(nn.Module):
-    def __init__(self, dz=6, dh=16, in_ch=1, num_classes=2, base=16, latent_dim=16, input_length=1800, **kw):
-        super().__init__()
-        if 'build_hypertiny_all_synth' in globals():
-            self.core = build_hypertiny_all_synth()
-        elif 'TinyMethodModel' in globals():
-            self.core = TinyMethodModel(in_ch, num_classes)
-        else:
-            self.core = SharedCoreSeparable1D(in_ch=in_ch, base=base, num_classes=num_classes,
-                                              latent_dim=latent_dim, input_length=input_length)
-        self._synth_cfg = {"dz": dz, "dh": dh, "mode": "all_synth"}
-    def forward(self, x): return self.core(x)
-
-# Minimal VAE encoder+head so TinyVAEHead exists if needed
-
-@_register_model
-class VAE1D_Enc(nn.Module):
-    def __init__(self, in_ch=1, base=16, latent_dim=16, input_length=1800, **kw):
-        super().__init__()
-        assert 'TinyVAE1D' in globals(), "TinyVAE1D must exist for VAE1D_Enc"
-        self.vae = TinyVAE1D(in_channels=in_ch, base=base, latent_dim=latent_dim, input_length=input_length)
-        self.latent_dim = latent_dim
-    @torch.no_grad()
-    def encode(self, x):
-        mu, logvar = self.vae.encode(x)
-        return mu, logvar
+def register_alias(alias: str, target: str):
+    """Map a friendly alias to a registered key (both lower-cased)."""
+    MODEL_ALIASES[alias.lower()] = target.lower()
 
 
-@_register_model
-class TinyVAEHead(nn.Module):
-    """Simple VAE encoder + linear head so the name exists for both suites."""
-    def __init__(self, in_ch=1, num_classes=2, z=16, base=16, input_length=1800, **kw):
-        super().__init__()
-        self.enc = VAE1D_Enc(in_ch=in_ch, base=base, latent_dim=z, input_length=input_length)
-        self.head = nn.Linear(z, num_classes)
-    def forward(self, x):
-        mu, logvar = self.enc.encode(x)
-        std = (0.5*logvar).exp().clamp_min(1e-3)
-        z = mu + torch.randn_like(std) * std
-        return self.head(z)
-
-class SafeFocalLoss(nn.Module):
+def safe_build_model(model_name: str, in_ch: int, num_classes: int, **model_kwargs):
     """
-    Stable multi-class focal loss (supports hard labels or soft/one-hot).
+    Resolve alias -> key, look up builder, and instantiate.
+    Raises a clear error listing available names if not found.
     """
-    def __init__(self, gamma=1.5, alpha=0.5, label_smoothing=0.05, reduction='mean'):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.label_smoothing = label_smoothing
-        self.reduction = reduction
-
-    def forward(self, logits, target):
-        # logits: (B, C)
-        if target.dtype in (torch.long, torch.int64):
-            C = logits.size(1)
-            with torch.no_grad():
-                smooth = self.label_smoothing
-                target_prob = torch.full_like(logits, smooth / max(1, C - 1))
-                target_prob.scatter_(1, target.view(-1,1), 1.0 - smooth)
-        else:
-            target_prob = target  # already soft / one-hot
-
-        logp = F.log_softmax(logits, dim=1)        # stable
-        p = logp.exp()
-        pt = (p * target_prob).sum(dim=1).clamp_min(1e-8)
-
-        ce = -(target_prob * logp).sum(dim=1)      # smoothed CE
-        focal = (self.alpha * (1.0 - pt).pow(self.gamma)) * ce
-
-        if self.reduction == 'mean':
-            return focal.mean()
-        elif self.reduction == 'sum':
-            return focal.sum()
-        return focal
+    key = MODEL_ALIASES.get(model_name.lower(), model_name.lower())
+    if key not in MODEL_BUILDERS:
+        avail = sorted(MODEL_BUILDERS.keys())
+        raise KeyError(f"Model '{model_name}' not registered. Available: {avail}")
+    return MODEL_BUILDERS[key](in_ch, num_classes, **model_kwargs)
 
 
-class LabelSmoothingCrossEntropy(nn.Module):
-    """Label smoothing for better generalization"""
-    def __init__(self, smoothing=0.1):
-        super().__init__()
-        self.smoothing = smoothing
+# ============================================================
+# Small Utilities used by multiple models
+# ============================================================
 
-    def forward(self, x, target):
-        confidence = 1. - self.smoothing
-        logprobs = F.log_softmax(x, dim=-1)
-        nll_loss = -logprobs.gather(dim=-1, index=target.unsqueeze(1))
-        nll_loss = nll_loss.squeeze(1)
-        smooth_loss = -logprobs.mean(dim=-1)
-        loss = confidence * nll_loss + self.smoothing * smooth_loss
-        return loss.mean()
+def _standardize_1d(x: torch.Tensor) -> torch.Tensor:
+    """
+    Per-sample, per-channel standardization over time dim.
+    x: (B,C,T)
+    """
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True).clamp_min(1e-6)
+    return (x - mean) / std
 
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=1.5, alpha=None, reduction="mean"):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.reduction = reduction
-        self.ce = nn.CrossEntropyLoss(reduction="none")
 
-    def forward(self, logits, target):
-        ce = self.ce(logits, target)  # [N]
-        pt = torch.softmax(logits, dim=1).gather(1, target.view(-1,1)).squeeze(1)
-        loss = ((1-pt)**self.gamma) * ce
-        if self.alpha is not None:
-            alpha_vec = torch.ones(logits.size(1), device=logits.device)
-            if isinstance(self.alpha, (list, tuple, torch.Tensor)):
-                alpha_vec = torch.tensor(self.alpha, dtype=logits.dtype, device=logits.device)
-            loss = alpha_vec[target] * loss
-        return loss.mean() if self.reduction == "mean" else loss.sum()
+def _derive_out_ch(out_ch: int, in_ch: int) -> int:
+    """
+    Ensure out_ch is positive; simple safety wrapper (kept for API parity).
+    """
+    out_ch = int(out_ch)
+    if out_ch <= 0:
+        out_ch = max(1, in_ch)
+    return out_ch
 
-@_register_model
+
+# Very lightweight placeholder for HRV-style features (16-dim)
+# You can replace with your precise feature set later; this keeps shapes stable.
+def _hrv_features(sig: np.ndarray, fs: float = 100.0) -> np.ndarray:
+    x = np.asarray(sig).astype(np.float32)
+    if x.ndim != 1:
+        x = x.reshape(-1)
+    x = np.nan_to_num(x)
+    L = max(1, x.size)
+    t = np.arange(L, dtype=np.float32) / max(1.0, fs)
+
+    feats = []
+    # Stats
+    feats += [x.mean(), x.std(), x.min(), x.max()]
+    # Simple morphology
+    feats += [np.median(x), np.percentile(x, 25), np.percentile(x, 75), np.ptp(x)]
+    # Rough slope/energy
+    dx = np.diff(x, prepend=x[:1])
+    feats += [float(np.mean(np.abs(dx))), float(np.mean(dx**2))]
+    # Very rough freq proxy
+    X = np.fft.rfft(x)
+    ps = np.abs(X)**2
+    feats += [float(ps.mean()), float(ps.max())]
+    # Duration + zcr-ish
+    zc = np.mean((x[1:] * x[:-1]) < 0.0) if L > 1 else 0.0
+    feats += [float(t[-1] if L > 0 else 0.0), float(zc)]
+
+    feats = np.array(feats, dtype=np.float32)
+    if feats.shape[0] < 16:
+        feats = np.pad(feats, (0, 16 - feats.shape[0]), mode="constant")
+    else:
+        feats = feats[:16]
+    return feats
+
+
+# ============================================================
+# Building Blocks
+# ============================================================
+
+@_register_model()
 class SqueezeExcite1D(nn.Module):
     """Lightweight SE block for 1D signals - improves feature selection"""
     def __init__(self, channels, reduction=4):
@@ -179,7 +142,7 @@ class SqueezeExcite1D(nn.Module):
         return x * self.se(x)
 
 
-@_register_model
+@_register_model()
 class DepthwiseSeparable1D(nn.Module):
     def __init__(self, in_ch, out_ch, k=5, stride=1, padding=None, use_se=True, use_residual=True):
         super().__init__()
@@ -192,7 +155,6 @@ class DepthwiseSeparable1D(nn.Module):
         self.bn2 = nn.BatchNorm1d(out_ch)
         self.act = nn.ReLU(inplace=True)
 
-        # Optional squeeze-excitation
         self.se = SqueezeExcite1D(out_ch) if use_se else None
 
         self._init_weights()
@@ -207,61 +169,64 @@ class DepthwiseSeparable1D(nn.Module):
 
     def forward(self, x):
         identity = x
-
-        # Depthwise conv
-        out = self.dw(x)
-        out = self.bn1(out)
-        out = self.act(out)
-
-        # Pointwise conv
-        out = self.pw(out)
-        out = self.bn2(out)
-
-        # SE block
+        out = self.dw(x); out = self.bn1(out); out = self.act(out)
+        out = self.pw(out); out = self.bn2(out)
         if self.se is not None:
             out = self.se(out)
-
-        # Residual connection
         if self.use_residual:
             out = out + identity
+        return self.act(out)
 
-        out = self.act(out)
-        return out
 
-@torch.no_grad()
+class MultiScaleFeatures(nn.Module):
+    """Extract features at multiple temporal scales"""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        out_ch = _derive_out_ch(out_ch, in_ch)
+        b1 = out_ch // 3
+        b2 = out_ch // 3
+        b3 = out_ch - (b1 + b2)
+        assert b1 > 0 and b2 > 0 and b3 > 0, "out_ch must be >= 3"
+
+        self.branches = nn.ModuleList([
+            nn.Conv1d(in_ch, b1, kernel_size=3, padding=1, bias=False),
+            nn.Conv1d(in_ch, b2, kernel_size=5, padding=2, bias=False),
+            nn.Conv1d(in_ch, b3, kernel_size=7, padding=3, bias=False),
+        ])
+        self.bn = nn.BatchNorm1d(out_ch)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        features = torch.cat([branch(x) for branch in self.branches], dim=1)
+        return self.act(self.bn(features))
 
 
 class SharedPWGenerator(nn.Module):
-    """Enhanced latent-to-weight generator with better expressivity"""
+    """Latent-to-weight generator"""
     def __init__(self, z_dim=16, hidden=64):
         super().__init__()
-        self.z = nn.Parameter(torch.randn(z_dim) * 0.02)  # Even smaller init
+        self.z = nn.Parameter(torch.randn(z_dim) * 0.02)
         self.net = nn.Sequential(
             nn.Linear(z_dim, hidden),
-            nn.LayerNorm(hidden),  # Better than BatchNorm for small latents
+            nn.LayerNorm(hidden),
             nn.ReLU(),
-            nn.Dropout(0.1),  # Regularization
+            nn.Dropout(0.1),
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
             nn.ReLU()
         )
-        self._init_weights()
-
-    def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight, gain=0.5)  # Smaller gain
+                nn.init.xavier_normal_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
     def forward(self):
-        h = self.net(self.z)
-        return h
-
+        return self.net(self.z)
 
 
 class PWHead(nn.Module):
-    """Enhanced projection with better weight generation"""
+    """Projection to conv(1x1) weights"""
     def __init__(self, h_dim, flat_out):
         super().__init__()
         mid_dim = max(1, min(h_dim, flat_out // 2))
@@ -277,69 +242,40 @@ class PWHead(nn.Module):
     def forward(self, h):
         return self.proj(h)
 
-# ==== Channel Split Safety Helper ====
 
+# ============================================================
+# Core Architectures
+# ============================================================
 
-class MultiScaleFeatures(nn.Module):
-    """Extract features at multiple temporal scales"""
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        # Split out_ch across 3 branches while preserving the exact sum
-        out_ch = _derive_out_ch(out_ch, in_ch)
-        b1 = out_ch // 3
-        b2 = out_ch // 3
-        b3 = out_ch - (b1 + b2)  # absorbs remainder so b1+b2+b3 == out_ch
-        assert b1 > 0 and b2 > 0 and b3 > 0, "out_ch must be >= 3"
-
-        self.branches = nn.ModuleList([
-            nn.Conv1d(in_ch, b1, kernel_size=3, padding=1, bias=False),
-            nn.Conv1d(in_ch, b2, kernel_size=5, padding=2, bias=False),
-            nn.Conv1d(in_ch, b3, kernel_size=7, padding=3, bias=False),
-        ])
-        self.bn = nn.BatchNorm1d(out_ch)  # matches concat channels
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        features = torch.cat([branch(x) for branch in self.branches], dim=1)
-        # assert features.shape[1] == self.bn.num_features, f"BN expects {self.bn.num_features}, got {features.shape[1]}"
-        return self.act(self.bn(features))
-
-
-
+@_register_model()
 class SharedCoreSeparable1D(nn.Module):
     """
-    Enhanced proposed model with:
-    - Multi-scale feature extraction
-    - Squeeze-Excitation attention
-    - Residual connections
-    - Learned attention weights + global pooling
-    - Better classifier head
+    Enhanced model with:
+    - Multi-scale stem
+    - Depthwise-separable stages (last PW synthesized)
+    - Attention-weighted pooling
     """
     def __init__(self, in_ch=1, base=16, num_classes=2, latent_dim=16, input_length=1800, hybrid_keep=1):
         super().__init__()
         self.base = base
 
-        # Stem with multi-scale features
         self.stem = nn.Sequential(
             MultiScaleFeatures(in_ch, base),
-            nn.MaxPool1d(2, 2)  # Reduce temporal dimension
+            nn.MaxPool1d(2, 2)
         )
 
-        # Depthwise-separable stages
         self.blocks = nn.ModuleList([
             DepthwiseSeparable1D(base, base*2, k=5, stride=2, use_se=True, use_residual=False),
             DepthwiseSeparable1D(base*2, base*2, k=5, stride=1, use_se=True, use_residual=True),
             DepthwiseSeparable1D(base*2, base*4, k=5, stride=2, use_se=True, use_residual=False),
         ])
 
-        # PW weight generator for the last pointwise conv (synthetic)
         self.gen = SharedPWGenerator(z_dim=latent_dim, hidden=96)
         self.last_pw_out = base*4
         self.last_pw_in  = base*2
         last_pw_shape = (self.last_pw_out, self.last_pw_in, 1)
         self.pw_head = PWHead(h_dim=96, flat_out=int(np.prod(last_pw_shape)))
 
-        # Attention weight head: produces (B,1,T) weights in [0,1]
         self.att_weight = nn.Sequential(
             nn.Conv1d(base*4, max(1, base//4), 1),
             nn.ReLU(inplace=True),
@@ -347,17 +283,10 @@ class SharedCoreSeparable1D(nn.Module):
             nn.Sigmoid()
         )
 
-        # Feature dim after pooling is channels of last stage
         feat_dim = base * 4
-
-        # Classifier head
         self.head = nn.Sequential(
-            nn.Linear(feat_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Linear(feat_dim, 64), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(64, 32), nn.ReLU(), nn.Dropout(0.1),
             nn.Linear(32, num_classes)
         )
         for m in self.head.modules():
@@ -368,111 +297,48 @@ class SharedCoreSeparable1D(nn.Module):
 
     def _synth_pw_weight(self):
         h = self.gen()
-        w = self.pw_head(h)
-        w = w.view(self.last_pw_out, self.last_pw_in, 1)
-        # Keep synthetic weights small
-        w = torch.tanh(w) * 0.05
-        return w
+        w = self.pw_head(h).view(self.last_pw_out, self.last_pw_in, 1)
+        return torch.tanh(w) * 0.05  # keep small
 
     def _forward_features(self, x):
-        # --- NEW: sanitize + standardize inputs ---
         x = torch.nan_to_num(x)
         x = _standardize_1d(x)
 
-        # light noise only during training (kept)
         if self.training:
             x = x + torch.randn_like(x) * 5e-7
 
-        x = self.stem(x)
-        x = torch.nan_to_num(x)
-
-        # First two blocks
+        x = self.stem(x); x = torch.nan_to_num(x)
         x = self.blocks[0](x); x = torch.nan_to_num(x)
         x = self.blocks[1](x); x = torch.nan_to_num(x)
 
-        # Third block: depthwise + BN/act, then synthetic PW, BN, SE, act
+        # third block but with synthetic PW
         b2 = self.blocks[2].dw(x)
         b2 = self.blocks[2].bn1(b2)
         b2 = self.blocks[2].act(b2)
 
-        # Synthetic PW conv
         w = self._synth_pw_weight()
         b2 = F.conv1d(b2, w, bias=None, stride=1, padding=0, groups=1)
         b2 = self.blocks[2].bn2(b2)
-
         if self.blocks[2].se is not None:
             b2 = self.blocks[2].se(b2)
         b2 = self.blocks[2].act(b2)
         b2 = torch.nan_to_num(b2)
 
-        # Attention-weighted global pooling (already stable with +1e-6, keep)
         att = self.att_weight(b2)               # (B,1,T)
-        b2_weighted = b2 * att                  # (B,C,T)
-        y = b2_weighted.sum(dim=-1) / (att.sum(dim=-1) + 1e-6)  # (B,C)
-
-        # --- NEW: final sanitize ---
-        y = torch.nan_to_num(y)
-        return y
+        y = (b2 * att).sum(dim=-1) / (att.sum(dim=-1) + 1e-6)  # (B,C)
+        return torch.nan_to_num(y)
 
     def forward(self, x):
         y = self._forward_features(x)
         return self.head(y)
 
-    def tinyml_packed_bytes(self):
-        total = 0
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                total += (m.weight.numel() * 8 + 7)//8
-        for p in list(self.gen.parameters()) + list(self.pw_head.parameters()):
-            total += (p.numel() * 4 + 7)//8
-        return {"boot": 1954, "lazy": total}
 
-
-
-
-class SafeFocalLoss(nn.Module):
-    """
-    Stable multi-class focal loss (supports hard labels or soft/one-hot).
-    """
-    def __init__(self, gamma=1.5, alpha=0.5, label_smoothing=0.05, reduction='mean'):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.label_smoothing = label_smoothing
-        self.reduction = reduction
-
-    def forward(self, logits, target):
-        # logits: (B, C)
-        if target.dtype in (torch.long, torch.int64):
-            C = logits.size(1)
-            with torch.no_grad():
-                smooth = self.label_smoothing
-                target_prob = torch.full_like(logits, smooth / max(1, C - 1))
-                target_prob.scatter_(1, target.view(-1,1), 1.0 - smooth)
-        else:
-            target_prob = target  # already soft / one-hot
-
-        logp = F.log_softmax(logits, dim=1)        # stable
-        p = logp.exp()
-        pt = (p * target_prob).sum(dim=1).clamp_min(1e-8)
-
-        ce = -(target_prob * logp).sum(dim=1)      # smoothed CE
-        focal = (self.alpha * (1.0 - pt).pow(self.gamma)) * ce
-
-        if self.reduction == 'mean':
-            return focal.mean()
-        elif self.reduction == 'sum':
-            return focal.sum()
-        return focal
-
-
-
+@_register_model()
 class TinyVAE1D(nn.Module):
     def __init__(self, in_channels=1, base=16, latent_dim=16, input_length=1800):
         super().__init__()
         self.latent_dim = latent_dim
 
-        # Enhanced encoder with residual connections
         self.enc = nn.Sequential(
             nn.Conv1d(in_channels, base, 7, 2, 3), nn.BatchNorm1d(base), nn.ReLU(),
             DepthwiseSeparable1D(base, base*2, k=5, stride=2, use_se=False, use_residual=False),
@@ -486,7 +352,6 @@ class TinyVAE1D(nn.Module):
             self._enc_channels = e.shape[1]
             self._enc_length = e.shape[2]
 
-        # Enhanced latent projection
         self.fc_mu = nn.Sequential(
             nn.Linear(self._enc_flat, latent_dim*2),
             nn.ReLU(),
@@ -504,49 +369,39 @@ class TinyVAE1D(nn.Module):
             nn.Linear(latent_dim*2, self._enc_flat)
         )
 
-        # Enhanced decoder
         self.dec = nn.Sequential(
             nn.ConvTranspose1d(base*2, base*2, 4, 2, 1), nn.BatchNorm1d(base*2), nn.ReLU(),
-            nn.ConvTranspose1d(base*2, base, 4, 2, 1), nn.BatchNorm1d(base), nn.ReLU(),
+            nn.ConvTranspose1d(base*2, base, 4, 2, 1),   nn.BatchNorm1d(base),   nn.ReLU(),
             nn.ConvTranspose1d(base, in_channels, 4, 2, 1),
         )
 
-        self._init_weights()
-
-    def _init_weights(self):
         for m in self.modules():
             if isinstance(m, (nn.Conv1d, nn.ConvTranspose1d)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
+                if getattr(m, "bias", None) is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight)
-                if m.bias is not None:
+                if getattr(m, "bias", None) is not None:
                     nn.init.constant_(m.bias, 0)
 
     def encode(self, x):
-        # --- NEW: sanitize + standardize before encode ---
         x = torch.nan_to_num(x)
         x = _standardize_1d(x)
         h = self.enc(x).view(x.size(0), -1)
-        mu = self.fc_mu(h)
-        lv = self.fc_lv(h)
-        # tighter & safer clamps
-        mu = torch.nan_to_num(mu).clamp(-10, 10)
-        lv = torch.nan_to_num(lv).clamp(-8, 8)
+        mu = torch.nan_to_num(self.fc_mu(h)).clamp(-10, 10)
+        lv = torch.nan_to_num(self.fc_lv(h)).clamp(-8, 8)
         return mu, lv
 
     def reparam(self, mu, lv):
-        std = torch.exp(0.5*lv).clamp_min(1e-3)   # --- NEW: avoid near-zero std
+        std = torch.exp(0.5*lv).clamp_min(1e-3)
         eps = torch.randn_like(std)
         return mu + eps*std
 
     def decode(self, z):
         h = self.dec_fc(z).view(z.size(0), self._enc_channels, self._enc_length)
         out = self.dec(h)
-        # --- NEW: bound + sanitize decoder output to avoid exploding recon ---
-        out = torch.tanh(out)                     # keep outputs finite
-        return torch.nan_to_num(out)
+        return torch.nan_to_num(torch.tanh(out))
 
     def forward(self, x):
         mu, lv = self.encode(x)
@@ -555,9 +410,9 @@ class TinyVAE1D(nn.Module):
         return xhat, mu, lv
 
 
-
+@_register_model()
 class VAEAdapter(nn.Module):
-    """Enhanced adapter with feature refinement"""
+    """Adapter over TinyVAE1D → returns refined latent."""
     def __init__(self, vae: TinyVAE1D):
         super().__init__()
         self.vae = vae
@@ -571,22 +426,19 @@ class VAEAdapter(nn.Module):
     def forward(self, x):
         mu, lv = self.vae.encode(x)
         refined = self.refine(mu)
-        return refined + mu  # Residual connection
+        return refined + mu
 
 
-
+@_register_model()
 class AttentionPool1D(nn.Module):
-    """
-    Parameter-free temporal attention pooling.
-    x: (B, C, T) -> returns (B, C)
-    """
+    """Parameter-free temporal attention pooling. x: (B,C,T) -> (B,C)"""
     def forward(self, x):
         score = x.mean(dim=1, keepdim=True)       # (B,1,T)
         alpha = torch.softmax(score, dim=-1)      # (B,1,T)
         return (x * alpha).sum(dim=-1)            # (B,C)
 
 
-
+@_register_model()
 class TinyHead(nn.Module):
     def __init__(self, in_dim, num_classes=2, hidden=32):
         super().__init__()
@@ -595,9 +447,6 @@ class TinyHead(nn.Module):
             nn.Linear(hidden*2, hidden), nn.ReLU(), nn.Dropout(0.1),
             nn.Linear(hidden, num_classes)
         )
-        self._init_weights()
-
-    def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight)
@@ -608,6 +457,9 @@ class TinyHead(nn.Module):
         return self.net(z)
 
 
+# ============================================================
+# Baselines + Proposed Variants
+# ============================================================
 
 class SeparableBlock(nn.Module):
     def __init__(self, in_ch, out_ch, k=3, stride=1):
@@ -623,115 +475,7 @@ class SeparableBlock(nn.Module):
         return self.act(x)
 
 
-
-class TinySeparableCNN(nn.Module):
-    """Lightweight separable CNN for TinyML"""
-    def __init__(self, in_ch, num_classes, base_filters=16, n_blocks=2):
-        super().__init__()
-        layers = []
-        cur_ch = in_ch
-        for i in range(n_blocks):
-            out_ch = base_filters * (2**i)
-            layers.append(SeparableBlock(cur_ch, out_ch))
-            if i < n_blocks - 1:  # no pooling after last block
-                layers.append(nn.MaxPool1d(2))
-            cur_ch = out_ch
-        self.body = nn.Sequential(*layers)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(cur_ch, num_classes)
-
-    def forward(self, x):
-        x = self.body(x)
-        x = self.pool(x).squeeze(-1)
-        return self.fc(x)
-
-
-
-class TinyVAEHead(nn.Module):
-    """VAE encoder + linear head (no decoder for inference)"""
-    def __init__(self, in_ch, num_classes, latent_dim=16, base_filters=16):
-        super().__init__()
-        self.conv1 = nn.Conv1d(in_ch, base_filters, 3, padding=1)
-        self.conv2 = nn.Conv1d(base_filters, base_filters*2, 3, padding=1)
-        self.pool = nn.AdaptiveAvgPool1d(8)  # reduce to manageable size
-        self.fc_mu = nn.Linear(base_filters*2*8, latent_dim)
-        self.fc_logvar = nn.Linear(base_filters*2*8, latent_dim)
-        self.head = nn.Linear(latent_dim, num_classes)
-
-    def encode(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = self.pool(x).flatten(1)  # (B, C*L)
-        mu = self.fc_mu(x)
-        logvar = self.fc_logvar(x)
-        return mu, logvar
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, x):
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        return self.head(z)
-
-
-
-class TinyMethodModel(nn.Module):
-    """Prototype of the method: synthesis MLP for channel mixing"""
-    def __init__(self, in_ch, num_classes, base_filters=16, latent_dim=8):
-        super().__init__()
-        # First layer: normal conv (would be kept in INT8)
-        self.stem = nn.Conv1d(in_ch, base_filters, 3, padding=1)
-
-        # Synthesis MLP (tiny)
-        self.synthesis_mlp = nn.Sequential(
-            nn.Linear(latent_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, base_filters * base_filters)  # for 1x1 conv weights
-        )
-
-        # Learnable latent code
-        self.latent_code = nn.Parameter(torch.randn(latent_dim))
-
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(base_filters, num_classes)
-
-    def forward(self, x):
-        # Apply stem
-        x = F.relu(self.stem(x))  # (B, base_filters, L)
-
-        # Synthesize pointwise conv weights
-        synth_weights = self.synthesis_mlp(self.latent_code)  # (base_filters^2,)
-        synth_weights = synth_weights.view(x.shape[1], x.shape[1], 1)  # (out, in, 1)
-
-        # Apply synthesized conv
-        x = F.conv1d(x, synth_weights)
-        x = F.relu(x)
-
-        x = self.pool(x).squeeze(-1)
-        return self.fc(x)
-
-
-# -------------------- Quick test runner ----------------
-
-
-class SeparableBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, k=3, stride=1):
-        super().__init__()
-        self.depthwise = nn.Conv1d(in_ch, in_ch, kernel_size=k, padding=k//2, groups=in_ch, bias=False)
-        self.pointwise = nn.Conv1d(in_ch, out_ch, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm1d(out_ch)
-        self.act = nn.ReLU()
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        x = self.bn(x)
-        return self.act(x)
-
-
-
+@_register_model()
 class TinySeparableCNN(nn.Module):
     """Lightweight separable CNN for TinyML - baseline model"""
     def __init__(self, in_ch, num_classes, base_filters=16, n_blocks=2):
@@ -741,7 +485,7 @@ class TinySeparableCNN(nn.Module):
         for i in range(n_blocks):
             out_ch = base_filters * (2**i)
             layers.append(SeparableBlock(cur_ch, out_ch))
-            if i < n_blocks - 1:  # no pooling after last block
+            if i < n_blocks - 1:
                 layers.append(nn.MaxPool1d(2))
             cur_ch = out_ch
         self.body = nn.Sequential(*layers)
@@ -754,134 +498,71 @@ class TinySeparableCNN(nn.Module):
         return self.fc(x)
 
 
-
-class TinyVAEHead(nn.Module):
-    """VAE encoder + linear head (no decoder for inference) - feature-forward baseline"""
-    def __init__(self, in_ch, num_classes, latent_dim=16, base_filters=16):
-        super().__init__()
-        self.conv1 = nn.Conv1d(in_ch, base_filters, 3, padding=1)
-        self.conv2 = nn.Conv1d(base_filters, base_filters*2, 3, padding=1)
-        self.pool = nn.AdaptiveAvgPool1d(8)  # reduce to manageable size
-        self.fc_mu = nn.Linear(base_filters*2*8, latent_dim)
-        self.fc_logvar = nn.Linear(base_filters*2*8, latent_dim)
-        self.head = nn.Linear(latent_dim, num_classes)
-
-    def encode(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = self.pool(x).flatten(1)  # (B, C*L)
-        mu = self.fc_mu(x)
-        logvar = self.fc_logvar(x)
-        return mu, logvar
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, x):
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        return self.head(z)
-
-
-
+@_register_model()
 class TinyMethodModel(nn.Module):
-    """The Method: Generative compression with synthesis MLP for channel mixing"""
+    """Prototype of the method: synthesis MLP for channel mixing"""
     def __init__(self, in_ch, num_classes, base_filters=16, latent_dim=8):
         super().__init__()
-        # First layer: normal conv (would be kept in INT8 for stability)
         self.stem = nn.Conv1d(in_ch, base_filters, 3, padding=1)
-
-        # Tiny synthesis MLP - replaces stored pointwise weights
         self.synthesis_mlp = nn.Sequential(
             nn.Linear(latent_dim, 32),
             nn.ReLU(),
-            nn.Linear(32, base_filters * base_filters)  # synthesize 1x1 conv weights
+            nn.Linear(32, base_filters * base_filters)
         )
-
-        # Learnable per-layer latent code (tiny storage)
         self.latent_code = nn.Parameter(torch.randn(latent_dim))
-
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Linear(base_filters, num_classes)
 
     def forward(self, x):
-        # Apply stem (kept in INT8)
         x = F.relu(self.stem(x))  # (B, base_filters, L)
-
-        # Synthesize pointwise conv weights from latent code
-        synth_weights = self.synthesis_mlp(self.latent_code)  # (base_filters^2,)
-        synth_weights = synth_weights.view(x.shape[1], x.shape[1], 1)  # (out, in, 1)
-
-        # Apply synthesized conv (generated at boot, not stored)
-        x = F.conv1d(x, synth_weights)
-        x = F.relu(x)
-
+        synth_weights = self.synthesis_mlp(self.latent_code).view(x.shape[1], x.shape[1], 1)
+        x = F.relu(F.conv1d(x, synth_weights))
         x = self.pool(x).squeeze(-1)
         return self.fc(x)
 
 
+@_register_model()
 class RegularCNN(nn.Module):
     """A regular CNN without TinyML constraints for comparison"""
     def __init__(self, input_length=1800, num_classes=2):
         super().__init__()
         self.input_length = input_length
-
-        # Larger feature extractor for baseline comparison
         self.features = nn.Sequential(
-            # Block 1
-            nn.Conv1d(1, 64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),
-
-            # Block 2
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),
-
-            # Block 3
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),
-
-            # Block 4
-            nn.Conv1d(256, 512, kernel_size=3, padding=1),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),
-
-            # Block 5
-            nn.Conv1d(512, 512, kernel_size=3, padding=1),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
+            nn.Conv1d(1, 64, kernel_size=7, padding=3), nn.BatchNorm1d(64), nn.ReLU(inplace=True), nn.MaxPool1d(2),
+            nn.Conv1d(64,128,kernel_size=5,padding=2), nn.BatchNorm1d(128), nn.ReLU(inplace=True), nn.MaxPool1d(2),
+            nn.Conv1d(128,256,kernel_size=3,padding=1),nn.BatchNorm1d(256), nn.ReLU(inplace=True), nn.MaxPool1d(2),
+            nn.Conv1d(256,512,kernel_size=3,padding=1),nn.BatchNorm1d(512), nn.ReLU(inplace=True), nn.MaxPool1d(2),
+            nn.Conv1d(512,512,kernel_size=3,padding=1),nn.BatchNorm1d(512), nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool1d(1)
         )
-
-        # Classifier head
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes)
+            nn.Dropout(0.5), nn.Linear(512, 256), nn.ReLU(inplace=True),
+            nn.Dropout(0.5), nn.Linear(256, num_classes)
         )
 
     def forward(self, x):
         x = self.features(x)         # (B, 512, 1)
         x = x.view(x.size(0), -1)    # (B, 512)
-        x = self.classifier(x)       # (B, C)
-        return x
+        return self.classifier(x)
 
 
+@_register_model()
+class RegularCNN1D(nn.Module):
+    """
+    Wrapper that accepts (in_ch, num_classes) and builds RegularCNN.
+    Keeps runner happy when it expects those params.
+    """
+    def __init__(self, in_ch=1, num_classes=2, **kw):
+        super().__init__()
+        self.core = RegularCNN(input_length=kw.get('input_length', 1800), num_classes=num_classes)
+    def forward(self, x): return self.core(x)
 
+
+@_register_model()
 class HRVFeatNet(nn.Module):
     """
     Computes a fixed 16D HRV(+amp) feature vector per window and learns a tiny linear head.
-    Training only updates the linear layer; feature extraction is a deterministic transform.
+    Training only updates the linear layer; feature extraction is deterministic.
     """
     def __init__(self, num_classes: int = 2, fs: float = 100.0):
         super().__init__()
@@ -904,15 +585,13 @@ class HRVFeatNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             f = self._batch_features(x)  # [B, 16]
-        # normalize features lightly for stability
         f = (f - f.mean(dim=0, keepdim=True)) / (f.std(dim=0, keepdim=True) + 1e-6)
         return self.head(f)
 
 
 # ---------------------------
-# B) Compact 1D-CNN baseline
+# Compact CNN / ResNet baselines
 # ---------------------------
-
 
 class ConvBlock(nn.Module):
     def __init__(self, c_in, c_out, k=7, s=1, p=None, pool=2):
@@ -923,13 +602,11 @@ class ConvBlock(nn.Module):
         self.gn   = nn.GroupNorm(1, c_out)
         self.act  = nn.SiLU(inplace=True)
         self.pool = nn.AvgPool1d(kernel_size=pool, stride=pool)
-
     def forward(self, x):
-        x = self.pool(self.act(self.gn(self.conv(x))))
-        return x
+        return self.pool(self.act(self.gn(self.conv(x))))
 
 
-
+@_register_model()
 class CNN1D_3Blocks(nn.Module):
     def __init__(self, in_ch=1, num_classes=2, base=16):
         super().__init__()
@@ -938,16 +615,9 @@ class CNN1D_3Blocks(nn.Module):
         self.b2    = ConvBlock(base*2, base*4, k=5, pool=2)
         self.head  = nn.Linear(base*4, num_classes)
     def forward(self, x):
-        x = self.stem(x)
-        x = self.b1(x)
-        x = self.b2(x)
+        x = self.stem(x); x = self.b1(x); x = self.b2(x)
         x = x.mean(dim=-1)  # GAP
         return self.head(x)
-
-
-# ---------------------------
-# C) Tiny 1D-ResNet baseline
-# ---------------------------
 
 
 class BasicBlock1D(nn.Module):
@@ -969,16 +639,12 @@ class BasicBlock1D(nn.Module):
         idt = x if self.down is None else self.down(x)
         out = self.act(self.gn1(self.conv1(x)))
         out = self.gn2(self.conv2(out))
-        out = self.act(out + idt)
-        return out
+        return self.act(out + idt)
 
 
-
+@_register_model()
 class ResNet1DSmall(nn.Module):
-    """
-    Stages: [base, 2*base, 2*base] with strides [2,2,2], 2 blocks per stage.
-    ~O(50–80k) params for base=16.
-    """
+    """Stages: [base, 2*base, 2*base] with strides [2,2,2], 2 blocks per stage."""
     def __init__(self, in_ch=1, num_classes=2, base=16):
         super().__init__()
         self.stem = nn.Sequential(
@@ -1009,45 +675,83 @@ class ResNet1DSmall(nn.Module):
         return self.head(x)
 
 
-# === Model registry ===
-MODEL_BUILDERS = {}
+# ============================================================
+# Losses (kept for compatibility)
+# ============================================================
 
-def _register_model(name: str | None = None):
-    """
-    Decorator for nn.Module classes. Registers a builder that tries a few common __init__ signatures:
-      1) (in_ch, num_classes, **kwargs)
-      2) (num_classes, **kwargs)
-      3) (**kwargs)
-    and stores it in MODEL_BUILDERS under `name` or class.__name__.lower().
-    """
-    def _wrap(cls):
-        key = (name or cls.__name__).lower()
-        if key in MODEL_BUILDERS:
-            raise ValueError(f"Duplicate model registration for '{key}'")
-        def _builder(in_ch: int, num_classes: int, **kwargs):
-            try:
-                return cls(in_ch=in_ch, num_classes=num_classes, **kwargs)
-            except TypeError:
-                try:
-                    return cls(num_classes=num_classes, **kwargs)
-                except TypeError:
-                    return cls(**kwargs)
-        MODEL_BUILDERS[key] = _builder
-        return cls
-    return _wrap
+class SafeFocalLoss(nn.Module):
+    """Stable multi-class focal loss (supports hard labels or soft/one-hot)."""
+    def __init__(self, gamma=1.5, alpha=0.5, label_smoothing=0.05, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+
+    def forward(self, logits, target):
+        if target.dtype in (torch.long, torch.int64):
+            C = logits.size(1)
+            with torch.no_grad():
+                smooth = self.label_smoothing
+                target_prob = torch.full_like(logits, smooth / max(1, C - 1))
+                target_prob.scatter_(1, target.view(-1,1), 1.0 - smooth)
+        else:
+            target_prob = target
+
+        logp = F.log_softmax(logits, dim=1)
+        p = logp.exp()
+        pt = (p * target_prob).sum(dim=1).clamp_min(1e-8)
+        ce = -(target_prob * logp).sum(dim=1)
+        focal = (self.alpha * (1.0 - pt).pow(self.gamma)) * ce
+        if self.reduction == 'mean':
+            return focal.mean()
+        elif self.reduction == 'sum':
+            return focal.sum()
+        return focal
 
 
-def register_alias(alias: str, target: str):
-    """Map a friendly alias to a registered key (both compared in lower-case)."""
-    MODEL_ALIASES[alias.lower()] = target.lower()
+class LabelSmoothingCrossEntropy(nn.Module):
+    """Label smoothing for better generalization"""
+    def __init__(self, smoothing=0.1):
+        super().__init__()
+        self.smoothing = smoothing
 
-def safe_build_model(model_name: str, in_ch: int, num_classes: int, **model_kwargs):
-    """
-    Resolve alias -> key, look up builder, and instantiate.
-    Raises a clear error listing available names if not found.
-    """
-    key = MODEL_ALIASES.get(model_name.lower(), model_name.lower())
-    if key not in MODEL_BUILDERS:
-        avail = sorted(MODEL_BUILDERS.keys())
-        raise KeyError(f"Model '{model_name}' not registered. Available: {avail}")
-    return MODEL_BUILDERS[key](in_ch, num_classes, **model_kwargs)
+    def forward(self, x, target):
+        confidence = 1. - self.smoothing
+        logprobs = F.log_softmax(x, dim=-1)
+        nll_loss = -logprobs.gather(dim=-1, index=target.unsqueeze(1)).squeeze(1)
+        smooth_loss = -logprobs.mean(dim=-1)
+        loss = confidence * nll_loss + self.smoothing * smooth_loss
+        return loss.mean()
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=1.5, alpha=None, reduction="mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+        self.ce = nn.CrossEntropyLoss(reduction="none")
+
+    def forward(self, logits, target):
+        ce = self.ce(logits, target)  # [N]
+        pt = torch.softmax(logits, dim=1).gather(1, target.view(-1,1)).squeeze(1)
+        loss = ((1-pt)**self.gamma) * ce
+        if self.alpha is not None:
+            alpha_vec = torch.ones(logits.size(1), device=logits.device)
+            if isinstance(self.alpha, (list, tuple, torch.Tensor)):
+                alpha_vec = torch.tensor(self.alpha, dtype=logits.dtype, device=logits.device)
+            loss = alpha_vec[target] * loss
+        return loss.mean() if self.reduction == "mean" else loss.sum()
+
+
+# ============================================================
+# Aliases for runner configs (IMPORTANT)
+# ============================================================
+
+# names used by experiments/configs → registered class keys
+register_alias("hrv_featnet",       "hrvfeatnet")
+register_alias("cnn3_small",        "cnn1d_3blocks")
+register_alias("resnet1d_small",    "resnet1dsmall")
+register_alias("tiny_separable_cnn","tinyseparablecnn")
+register_alias("regular_cnn",       "regularcnn1d")
