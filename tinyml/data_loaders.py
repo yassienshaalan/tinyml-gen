@@ -24,7 +24,8 @@ except Exception:
 USE_WEIGHTED_SAMPLER = True
 def _is_gcs_path(p: Union[str, Path]) -> bool:
     return str(p).startswith("gs://")
-	
+WORKERS = int(os.environ.get("DATALOADER_WORKERS", "0"))
+
 def _normalize_gs_uri(uri: str) -> str:
     if not isinstance(uri, str):
         return uri
@@ -370,10 +371,19 @@ def _record_apnea_stats(root: Union[str, Path], records: list[str]):
 def _records_from_index(ds):
     return sorted({rid for (rid, _, _) in ds.dataset.index})
 
-def _wif(worker_id):
-    s = getattr(cfg, "seed", 42) + worker_id
-    np.random.seed(s)
-    random.seed(s)
+def _wif(worker_id: int):
+    """
+    Seed numpy/python/torch for each worker without depending on `cfg`.
+    Uses torch.initial_seed() when available; otherwise an env-based base.
+    """
+    try:
+        base = torch.initial_seed() % (2**32)
+    except Exception:
+        base = int(os.environ.get("WORKER_SEED_BASE", "42"))
+    seed = (int(base) + int(worker_id)) % (2**32 - 1)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 	
 def _stratified_record_split_apnea(root, recs, seed=1337, frac=(0.8, 0.1, 0.1)):
     """
@@ -664,9 +674,9 @@ def load_mitdb_loaders(root: Union[str, Path], batch_size=64, length=1800, binar
     va_ds = MITBIHBeats(root, va_recs, length=length, binary=binary)
     te_ds = MITBIHBeats(root, te_recs, length=length, binary=binary)
 
-    tr = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=2, worker_init_fn=_wif)
-    va = DataLoader(va_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=2, worker_init_fn=_wif)
-    te = DataLoader(te_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=2, worker_init_fn=_wif)
+    tr = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=WORKERS, worker_init_fn=_wif)
+    va = DataLoader(va_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=WORKERS, worker_init_fn=_wif)
+    te = DataLoader(te_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=WORKERS, worker_init_fn=_wif)
     return tr, va, te, {"binary": binary, "records": {"train": len(tr_recs), "val": len(va_recs), "test": len(te_recs)}}
 
 # =============================
@@ -862,7 +872,7 @@ def load_ptbxl_loaders(
     va_ds = PTBXLWindows(va, raw_root, length=length, lead=lead)
     te_ds = PTBXLWindows(te, raw_root, length=length, lead=lead)
 
-    tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=2, worker_init_fn=_wif)
-    va_loader = DataLoader(va_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=2, worker_init_fn=_wif)
-    te_loader = DataLoader(te_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=2, worker_init_fn=_wif)
+    tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=WORKERS, worker_init_fn=_wif)
+    va_loader = DataLoader(va_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=WORKERS, worker_init_fn=_wif)
+    te_loader = DataLoader(te_ds, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=WORKERS, worker_init_fn=_wif)
     return tr_loader, va_loader, te_loader, {"n_classes": len(set(classes)), "task": task, "lead": lead}
