@@ -42,6 +42,8 @@ FS = 100  # Apnea-ECG sampling rate
 THRESH_GRID = np.linspace(0.05, 0.95, 19)
 def line(): print("-"*80)
 
+import datetime, os
+RUN_STAMP = os.environ.get("RUN_STAMP", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
 
 	
 # --- Normalize different dataset returns to (tr, va, te, meta) ---
@@ -3253,7 +3255,8 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
     '''
     v_logits, vy = evaluate_logits(model, dl_va, device=device)
     vp = eval_prob_fn(v_logits)
-    t_star, val_f1 = tune_threshold(vy, vp)
+    vp_smooth = _medfilt(vp, k=5)
+    t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
 
     vy_hat = (vp >= t_star).astype(int)
     _val_avg = _choose_avg(vy)  # or 'binary' if you prefer to force binary
@@ -3421,20 +3424,46 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None):
     print(" Saved: comprehensive_tinyml_results.csv")
     return df
 
+def _stamp_str():
+    """
+    Single-run stamp. You can override via env RUN_STAMP=YYYYmmdd-HHMMSS
+    so all artifacts from one run share the same folder/name suffix.
+    """
+    return os.environ.get("RUN_STAMP", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+
+def _sanitize_token(s: str) -> str:
+    s = str(s).strip().lower()
+    s = re.sub(r"[^a-z0-9_.\-]+", "_", s)
+    return s.strip("_") or "unk"
+
+def _splitext_keepdot(name: str):
+    i = name.rfind(".")
+    return (name, "") if i <= 0 else (name[:i], name[i:])
+
+def _with_stamp(filename: str, stamp: str) -> str:
+    """
+    Insert _<stamp> before extension unless already present.
+    E.g., 'results.csv' -> 'results_20250923-153201.csv'
+    """
+    stem, ext = _splitext_keepdot(filename)
+    if stem.endswith(stamp):  # already stamped
+        return f"{stem}{ext}"
+    return f"{stem}_{stamp}{ext}"
+
 def _destinations():
     """
     Decide where to write:
-      - Local:  TINYML_RESULTS_LOCAL  (default: ./results)
-                OR (if set) TINYML_RESULTS_DIR when it's a non-gs path
+      - Local:  TINYML_RESULTS_LOCAL (default: ./results)
+                OR TINYML_RESULTS_DIR when it's a non-gs path
       - GCS:    TINYML_RESULTS_GCS
-                OR (if set) TINYML_RESULTS_DIR when it's a gs:// path
+                OR TINYML_RESULTS_DIR when it's a gs:// path
 
-    You can set both env vars, or just set TINYML_RESULTS_DIR to gs:// and
-    we'll still keep a local copy under ./results by default.
+    We always keep a local copy; GCS is best-effort.
     """
-    env_dir  = os.environ.get("TINYML_RESULTS_DIR")     # may be local OR gs://
-    env_gcs  = os.environ.get("TINYML_RESULTS_GCS")     # gs:// preferred
-    env_loc  = os.environ.get("TINYML_RESULTS_LOCAL","/home/yassien/tinyml-gen/tinyml/results")   
+    env_dir = os.environ.get("TINYML_RESULTS_DIR")     # may be local OR gs://
+    env_gcs = os.environ.get("TINYML_RESULTS_GCS")     # gs:// preferred
+    env_loc = os.environ.get("TINYML_RESULTS_LOCAL", "/home/yassien/tinyml-gen/tinyml/results")
+
     # Defaults
     local_root = Path(env_loc or "./results")
     gcs_root   = None
@@ -3448,73 +3477,137 @@ def _destinations():
     if env_gcs:
         gcs_root = env_gcs.rstrip("/")
 
-    # Ensure local exists
     local_root.mkdir(parents=True, exist_ok=True)
     return local_root, gcs_root
 
-def save_df_both(df, filename: str, subdir: str | None = None):
+def _gcsfs_handle():
+    import gcsfs  # type: ignore
+    return gcsfs.GCSFileSystem(token="google_default")
+
+def _gcs_write_bytes(gcs_root: str, relpath: str, payload: bytes):
     """
-    Save a DataFrame to BOTH local and (optionally) GCS.
-    - Never raises on GCS failure; logs a warning instead.
-    - Returns a dict with 'local' (always) and 'gcs' or 'gcs_error'.
+    Write bytes to gs://<bucket>/<relpath>. Never raise: return (True|False, path, errstr or None)
     """
+    try:
+        fs = _gcsfs_handle()
+        gcs_path = f"{gcs_root.rstrip('/')}/{relpath.lstrip('/')}"
+        with fs.open(gcs_path, "wb") as f:
+            f.write(payload)
+        return True, gcs_path, None
+    except Exception as e:
+        return False, f"{gcs_root.rstrip('/')}/{relpath.lstrip('/')}", f"{type(e).__name__}: {e}"
+
+def save_df_both(
+    df,
+    filename: str,
+    subdir: str | None = None,
+    stamp: str | None = None,
+    split_by_dataset: bool = False,
+    also_combined: bool = True,
+):
+    """
+    Save a DataFrame to BOTH local and (optionally) GCS with:
+      - Timestamped filenames (default RUN_STAMP or now)
+      - Grouped under run folder: results/run-<stamp>[/<subdir>]
+      - Optionally split per-dataset (requires 'dataset' column)
+      - Also save a combined CSV when split_by_dataset=True and also_combined=True
+    Returns dict of paths: {'local':[...], 'gcs':[...], 'gcs_error':[...] }
+    """
+    import pandas as pd  # local import (common in this file anyway)
+
     local_root, gcs_root = _destinations()
-    out = {}
+    stamp = stamp or _stamp_str()
 
-    # -- Local (always) --
-    loc_dir = local_root / subdir if subdir else local_root
-    loc_dir.mkdir(parents=True, exist_ok=True)
-    loc_path = (loc_dir / filename).as_posix()
-    df.to_csv(loc_path, index=False)
-    print(f"[save] local -> {loc_path}")
-    out["local"] = loc_path
+    # Put each run in its own folder to avoid clashes
+    run_dir = f"run-{stamp}"
+    if subdir:
+        run_subdir = f"{run_dir}/{_sanitize_token(subdir)}"
+    else:
+        run_subdir = run_dir
 
-    # -- GCS (best-effort) --
-    if gcs_root:
-        gcs_path = None
-        try:
-            fs = _gcsfs_handle()  # may raise if gcsfs not installed or ADC not set
-            gprefix = gcs_root + ("/" + subdir.strip("/") if subdir else "")
-            gcs_path = f"{gprefix}/{filename}"
-            payload = df.to_csv(index=False).encode("utf-8")
-            with fs.open(gcs_path, "wb") as f:
-                f.write(payload)
-            print(f"[save] gcs   -> {gcs_path}")
-            out["gcs"] = gcs_path
-        except Exception as e:
-            # Do not fail the run; just log a warning and continue
-            where = gcs_path if gcs_path else (gcs_root + "/" + filename)
-            print(f"[save][warn] failed to write to GCS: {where} | {type(e).__name__}: {e}")
-            out["gcs_error"] = f"{type(e).__name__}: {e}"
+    out = {"local": [], "gcs": [], "gcs_error": []}
+
+    def _save_one(df_one: "pd.DataFrame", fname: str):
+        # Always stamp the filename
+        fname_stamped = _with_stamp(fname, stamp)
+        # Local
+        loc_dir = local_root / run_subdir
+        loc_dir.mkdir(parents=True, exist_ok=True)
+        loc_path = (loc_dir / fname_stamped)
+        df_one.to_csv(loc_path.as_posix(), index=False)
+        print(f"[save] local -> {loc_path.as_posix()}")
+        out["local"].append(loc_path.as_posix())
+        # GCS best-effort
+        if gcs_root:
+            ok, gcs_path, err = _gcs_write_bytes(gcs_root, f"{run_subdir}/{fname_stamped}",
+                                                 df_one.to_csv(index=False).encode("utf-8"))
+            if ok:
+                print(f"[save] gcs   -> {gcs_path}")
+                out["gcs"].append(gcs_path)
+            else:
+                print(f"[save][warn] failed to write to GCS: {gcs_path} | {err}")
+                out["gcs_error"].append(f"{gcs_path} | {err}")
+
+    # Split or not
+    if split_by_dataset and "dataset" in df.columns:
+        if also_combined:
+            _save_one(df, filename)  # combined (all datasets)
+        for ds, sub in df.groupby("dataset"):
+            ds_token = _sanitize_token(ds)
+            stem, ext = _splitext_keepdot(filename)
+            fname_ds = f"{stem}_{ds_token}{ext or '.csv'}"
+            _save_one(sub, fname_ds)
+    else:
+        _save_one(df, filename)
 
     return out
 
+# Backwards-compatible wrapper (so you don't have to touch other call sites).
+# NOW: saves stamped + per-dataset when possible.
+def save_df_to_drive(df, filename, subdir=None, stamp=None, split_by_dataset=True, also_combined=True):
+    return save_df_both(
+        df,
+        filename,
+        subdir=subdir,
+        stamp=stamp,
+        split_by_dataset=split_by_dataset,
+        also_combined=also_combined,
+    )
 
-# Backwards-compatible wrapper (so you don't have to touch other call sites)
-def save_df_to_drive(df, filename, subdir=None):
-    return save_df_both(df, filename, subdir=subdir)
-
-# If you also save raw bytes or JSON elsewhere, you can mirror with helpers like:
-def save_bytes_both(payload: bytes, filename: str, subdir: str | None = None):
+def save_bytes_both(payload: bytes, filename: str, subdir: str | None = None, stamp: str | None = None):
+    """
+    Save raw bytes (e.g., PNG) locally and (best-effort) to GCS, stamped and run-scoped.
+    """
     local_root, gcs_root = _destinations()
-    out = {}
+    stamp = stamp or _stamp_str()
+
+    run_dir = f"run-{stamp}"
+    run_subdir = f"{run_dir}/{_sanitize_token(subdir)}" if subdir else run_dir
+
+    # filename stamped
+    fname_stamped = _with_stamp(filename, stamp)
+
+    out = {"local": None, "gcs": None, "gcs_error": None}
+
     # local
-    loc_dir = local_root / subdir if subdir else local_root
+    loc_dir = local_root / run_subdir
     loc_dir.mkdir(parents=True, exist_ok=True)
-    loc_path = (loc_dir / filename).as_posix()
+    loc_path = (loc_dir / fname_stamped)
     with open(loc_path, "wb") as f:
         f.write(payload)
-    print(f"[save] local -> {loc_path}")
-    out["local"] = loc_path
+    print(f"[save] local -> {loc_path.as_posix()}")
+    out["local"] = loc_path.as_posix()
+
     # gcs
     if gcs_root:
-        fs = _gcsfs_handle()
-        gprefix = gcs_root + ("/" + subdir.strip("/") if subdir else "")
-        gcs_path = f"{gprefix}/{filename}"
-        with fs.open(gcs_path, "wb") as f:
-            f.write(payload)
-        print(f"[save] gcs   -> {gcs_path}")
-        out["gcs"] = gcs_path
+        ok, gcs_path, err = _gcs_write_bytes(gcs_root, f"{run_subdir}/{fname_stamped}", payload)
+        if ok:
+            print(f"[save] gcs   -> {gcs_path}")
+            out["gcs"] = gcs_path
+        else:
+            print(f"[save][warn] failed to write to GCS: {gcs_path} | {err}")
+            out["gcs_error"] = f"{gcs_path} | {err}"
+
     return out
 def quick_test():
     """Run a quick test with minimal config to verify everything works"""
@@ -4854,7 +4947,8 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
     try:
         v_logits, vy = evaluate_logits(model, dl_va, device=device)
         vp = eval_prob_fn(v_logits)
-        t_star, val_f1 = tune_threshold(vy, vp)
+        vp_smooth = _medfilt(vp, k=5)
+        t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
     except Exception:
         t_star, val_f1 = 0.5, None
 
@@ -5053,16 +5147,15 @@ def build_model_grid_for_dataset(ds_key: str):
         add(
             model='tiny_method',
             kd=kd,
-            kwargs={
-                # model-specific
-                'dz': dz, 'dh': dh,
-                # training knobs (read by run_one)
-                'use_focal': FOCAL,
-                'qat_bits': q, 'qat_start_frac': 0.5,
+            kwargs= {
+                # model knobs
+                'dz': 6, 'dh': 16,  # (or (4,12) and (6,16) sweep)
+                # training knobs
+                'use_focal': True,
                 'kd_alpha': 0.65, 'kd_temp': 3.5,
-                'feat_loss_weight': 0.10,
-                # include both names so size/registry mappers are happy
-                'quant_bits': q, 'qbits': q,
+                'feat_loss_weight': 0.10,         # small feature hint (if available)
+                'qat_bits': 6, 'qat_start_frac': 0.5,  # QAT in latter half
+                'quant_bits': 6, 'qbits': 6,      # keep both names for downstream size code
             },
             tag=f"-dz{dz}-dh{dh}-b{q}-{'kd' if kd else 'nokd'}"
         )
@@ -5072,11 +5165,15 @@ def build_model_grid_for_dataset(ds_key: str):
         add(
             model='tiny_vae_head',
             kd=kd,
-            kwargs={
-                'use_focal': FOCAL,
-                'qat_bits': q, 'qat_start_frac': 0.5,
+            kwargs= {
+                # model knobs
+                'dz': 6, 'dh': 16,  # (or (4,12) and (6,16) sweep)
+                # training knobs
+                'use_focal': True,
                 'kd_alpha': 0.65, 'kd_temp': 3.5,
-                'quant_bits': q, 'qbits': q,
+                'feat_loss_weight': 0.10,         # small feature hint (if available)
+                'qat_bits': 6, 'qat_start_frac': 0.5,  # QAT in latter half
+                'quant_bits': 6, 'qbits': 6,      # keep both names for downstream size code
             },
             tag=f"-b{q}-{'kd' if kd else 'nokd'}"
         )
@@ -5292,7 +5389,8 @@ def run_one(spec):
     if (ep + 1) % max(1, spec['epochs'] // 3) == 0:
         v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
         vp = eval_prob_fn(v_logits)
-        t_star, val_f1 = tune_threshold(vy, vp, THRESH_GRID)
+        vp_smooth = _medfilt(vp, k=5)
+        t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
         if val_f1 > best[0]:
             best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
         val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
@@ -5302,7 +5400,8 @@ def run_one(spec):
     # ----- final eval (tuned on val) -----
     v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
     vp = eval_prob_fn(v_logits)
-    t_star, val_f1 = tune_threshold(vy, vp, THRESH_GRID)
+    vp_smooth = _medfilt(vp, k=5)
+    t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
     if val_f1 > best[0]:
         best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
 
@@ -8229,7 +8328,8 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
     '''
     v_logits, vy = evaluate_logits(model, dl_va, device=device)
     vp = eval_prob_fn(v_logits)
-    t_star, val_f1 = tune_threshold(vy, vp)
+    vp_smooth = _medfilt(vp, k=5)
+    t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
 
     vy_hat = (vp >= t_star).astype(int)
     _val_avg = _choose_avg(vy)  # or 'binary' if you prefer to force binary
@@ -9638,7 +9738,8 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
     try:
         v_logits, vy = evaluate_logits(model, dl_va, device=device)
         vp = eval_prob_fn(v_logits)
-        t_star, val_f1 = tune_threshold(vy, vp)
+        vp_smooth = _medfilt(vp, k=5)
+        t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
     except Exception:
         t_star, val_f1 = 0.5, None
 
@@ -10018,6 +10119,12 @@ def _ensure_meta(meta: Dict, dl_tr):
     return meta
 # One run with optional KD, periodic threshold-aware val metrics, and JSON output
 
+def _medfilt(p, k=5):
+    import numpy as np
+    from scipy.signal import medfilt
+    return medfilt(p, kernel_size=k) if len(p) >= k else p
+
+
 def run_one(spec):
     """
     spec keys expected:
@@ -10104,10 +10211,10 @@ def run_one(spec):
     for ep in range(spec['epochs']):
         # QAT: enable halfway through training if model exposes set_qat/clear_qat
         if hasattr(model, "set_qat"):
-            if ep >= int(qat_start_frac * spec['epochs']):
+            if ep >= int(qat_start_frac * spec['epochs']): 
                 model.set_qat(qat_bits)
-            else:
-                model.clear_qat()
+        else: 
+            model.clear_qat()
 
         # KD or plain CE epoch
         if teacher is not None:
@@ -10144,7 +10251,8 @@ def run_one(spec):
         if (ep + 1) % max(1, spec['epochs'] // 3) == 0 or (ep + 1) == spec['epochs']:
             v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
             vp = eval_prob_fn(v_logits)
-            t_star, val_f1 = tune_threshold(vy, vp, THRESH_GRID)
+            vp_smooth = _medfilt(vp, k=5)
+            t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
             if val_f1 > best[0]:
                 best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
             val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
@@ -10159,7 +10267,8 @@ def run_one(spec):
     # choose best val state if it beat EMA snapshot
     v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
     vp = eval_prob_fn(v_logits)
-    t_star, val_f1 = tune_threshold(vy, vp, THRESH_GRID)
+    vp_smooth = _medfilt(vp, k=5)
+    t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
     if best[0] >= val_f1 and best[2] is not None:
         model.load_state_dict(best[2])
         t_star = best[1]
