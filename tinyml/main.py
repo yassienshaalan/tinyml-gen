@@ -111,8 +111,8 @@ def _mitdb_gcs_wrapper(batch_size=64, length=1800, binary=True, **_):
 register_dataset('apnea_ecg', _apnea_gcs_wrapper)
 
 # Flip these to True if you want them in this run
-REGISTER_PTB = False
-REGISTER_MIT = False
+REGISTER_PTB = True
+REGISTER_MIT = true
 if REGISTER_PTB:
     register_dataset('ptbxl', _ptbxl_gcs_wrapper)
 if REGISTER_MIT:
@@ -135,16 +135,21 @@ cfg = ExpCfg(
 seed_everything(getattr(cfg, "seed", 42))
 
 def main():
-    # Show normalized roots up front + guard gs:// typos
-    apnea_root = _pick_root("APNEA_ROOT", DL_APNEA_ROOT)
-    ptbxl_root = _pick_root("PTBXL_ROOT", DL_PTBXL_ROOT)
-    mitdb_root = _pick_root("MITDB_ROOT", DL_MITDB_ROOT)
-    print("[Roots]", apnea_root, ptbxl_root, mitdb_root)
-    #assert not apnea_root.startswith("gs:/"), f"Fix APNEA_ROOT: {apnea_root} -> must be gs://..."
+   if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--datasets", type=str, default="apnea_ecg",
+                        help="comma-separated: apnea_ecg,ptbxl,mitdb")
+    args = parser.parse_args()
+    datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
 
-    logging.info("[Registry] Available datasets: %s", available_datasets())
-    # Start with apnea_ecg only, exactly like your old main
-    df = run_all_experiments(cfg, datasets=['apnea_ecg'])
+    # register only what you’ll use
+    register_dataset('apnea_ecg', _apnea_gcs_wrapper)
+    if "ptbxl" in datasets: register_dataset('ptbxl', _ptbxl_gcs_wrapper)
+    if "mitdb" in datasets: register_dataset('mitdb', _mitdb_gcs_wrapper)
+
+    print("[Available]", available_datasets())
+    print("[Run]", datasets)
+    df = run_all_experiments(cfg, datasets=datasets)
     print("Final thing")
     print(df)
 
