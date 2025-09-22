@@ -9729,110 +9729,95 @@ def build_model_grid_for_dataset(ds_key: str):
 '''
 def build_model_grid_for_dataset(ds: str):
     """
-    Returns a list of dict specs: {'name': <model>, 'kwargs': {...}, 'kd': bool}
-    We expand all the combinations needed to mirror the paper + your stronger baselines.
+    Balanced 21-run suite (per dataset):
+      - focal=True everywhere (consistent loss setup)
+      - bits in {8, 6} (keeps a light size sweep)
+      - KD only for tiny_method and tiny_vae_head
+    Returns: list of specs {'name': str, 'kd': bool, 'kwargs': dict}
     """
     grid = []
+    bits   = [8, 6]
+    focal  = True
 
-    # Global toggles / sweeps
-    kd_opts       = [False, True]
-    focal_opts    = [False, True]          # If your trainer reads this; else safely ignored
-    qbit_opts     = [8, 6, 4]              # Quantization bit-widths for packed flash (adjust names if needed)
-
-    # ---- Method variants (your proposed model)
-    # Latent sizes typically used in paper ablations
-    latent_pairs  = [(4, 12), (6, 16)]     # (dz, dh)
-    for (dz, dh), kd, focal, qbits in product(latent_pairs, kd_opts, focal_opts, qbit_opts):
+    # --- tiny_method (8 runs): 2 latents x 2 KD x 2 bits
+    for (dz, dh), kd, q in product([(4,12), (6,16)], [False, True], bits):
         grid.append({
             'name': 'tiny_method',
             'kd': kd,
             'kwargs': {
-                # If your method class expects these names, great; otherwise rename:
                 'dz': dz, 'dh': dh,
                 'use_focal': focal,
-                # Quantization knobs (rename to match your estimator / model if needed):
-                'quant_bits': qbits,        # <- change to 'qbits_pw'/'qbits_head' if your code expects that
-                'qbits': qbits,
+                # include both keys; your builder maps/filters as needed
+                'quant_bits': q,
+                'qbits': q,
             }
         })
 
-    # ---- VAE-head baseline
-    for kd, focal, qbits in product(kd_opts, focal_opts, qbit_opts):
+    # --- tiny_vae_head (4 runs): 2 KD x 2 bits
+    for kd, q in product([False, True], bits):
         grid.append({
             'name': 'tiny_vae_head',
             'kd': kd,
             'kwargs': {
                 'use_focal': focal,
-                'quant_bits': qbits,
-                'qbits': qbits,
+                'quant_bits': q,
+                'qbits': q,
             }
         })
 
-    # ---- Compact CNN (3 blocks)
-    for kd, focal, qbits in product(kd_opts, focal_opts, qbit_opts):
-        grid.append({
-            'name': 'cnn3_small',
-            'kd': kd,
-            'kwargs': {
-                'base': 16,                 # bump to 24 if you want a stronger baseline
-                'use_focal': focal,
-                'quant_bits': qbits,
-                'qbits': qbits,
-            }
-        })
+    # --- compact CNNs & regular CNN (8 runs): KD=False x 2 bits each
+    for q in bits:
+        grid += [
+            {
+                'name': 'cnn3_small',
+                'kd': False,
+                'kwargs': {
+                    'base': 16,            # keep small; bump to 24 if you want
+                    'use_focal': focal,
+                    'quant_bits': q, 'qbits': q,
+                }
+            },
+            {
+                'name': 'resnet1d_small',
+                'kd': False,
+                'kwargs': {
+                    'base': 16,
+                    'use_focal': focal,
+                    'quant_bits': q, 'qbits': q,
+                }
+            },
+            {
+                'name': 'tiny_separable_cnn',
+                'kd': False,
+                'kwargs': {
+                    'base_filters': 16,
+                    'n_blocks': 2,
+                    'use_focal': focal,
+                    'quant_bits': q, 'qbits': q,
+                }
+            },
+            {
+                'name': 'regular_cnn',
+                'kd': False,
+                'kwargs': {
+                    'use_focal': focal,
+                    'quant_bits': q, 'qbits': q,
+                }
+            },
+        ]
 
-    # ---- ResNet small
-    for kd, focal, qbits in product(kd_opts, focal_opts, qbit_opts):
-        grid.append({
-            'name': 'resnet1d_small',
-            'kd': kd,
-            'kwargs': {
-                'base': 16,
-                'use_focal': focal,
-                'quant_bits': qbits,
-                'qbits': qbits,
-            }
-        })
+    # --- HRV baseline (1 run): KD=False
+    grid.append({
+        'name': 'hrv_featnet',
+        'kd': False,
+        'kwargs': {
+            'fs': 100.0,
+            'use_focal': focal,
+        }
+    })
 
-    # ---- Tiny separable CNN
-    for kd, focal, qbits in product(kd_opts, focal_opts, qbit_opts):
-        grid.append({
-            'name': 'tiny_separable_cnn',
-            'kd': kd,
-            'kwargs': {
-                'base_filters': 16,
-                'n_blocks': 2,
-                'use_focal': focal,
-                'quant_bits': qbits,
-                'qbits': qbits,
-            }
-        })
-
-    # ---- Regular CNN (reference, larger)
-    for kd, focal, qbits in product(kd_opts, focal_opts, qbit_opts):
-        grid.append({
-            'name': 'regular_cnn',
-            'kd': kd,
-            'kwargs': {
-                'use_focal': focal,
-                'quant_bits': qbits,
-                'qbits': qbits,
-            }
-        })
-
-    # ---- HRV feature + linear head (tiny baseline)
-    for kd, focal in product(kd_opts, focal_opts):
-        grid.append({
-            'name': 'hrv_featnet',
-            'kd': kd,
-            'kwargs': {
-                'fs': 100.0,
-                'use_focal': focal,
-                # usually quantization is negligible here; leave bits out or set qbits=8
-            }
-        })
-
-    # You can also filter by dataset if some models don't apply (e.g., multi-lead vs single-lead)
+    # Optional: sanity print
+    print(f"[grid] {ds}: planned {len(grid)} runs (balanced suite)")
     return grid
 	
 
