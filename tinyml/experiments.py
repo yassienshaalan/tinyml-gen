@@ -971,19 +971,39 @@ class DepthwiseSeparable1D(nn.Module):
         out = self.act(out)
         return out
 
-@torch.no_grad()
-def eval_classifier_plus(model, loader, device, return_probs=False):
+def eval_classifier_plus(model, loader, device, return_probs=False,
+                         threshold: float | None = None, smooth_k: int | None = None):
+    """
+    Default: raw probs, 0.5 threshold (no smoothing). 
+    If threshold is provided, we threshold (optionally on smoothed probs).
+    AUC is always computed on RAW probs.
+    """
+    from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score
+
     logits, y = eval_logits(model, loader, device)
-    p1 = eval_prob_fn(logits)
-    yhat = (p1 >= 0.5).astype(int)
+    p1 = eval_prob_fn(logits)          # RAW probabilities for AUC
+
+    # Decide what to threshold
+    if threshold is None:
+        # simple 0.5 on raw probs (old behavior)
+        p_for_thr = p1
+        thr = 0.5
+    else:
+        # if a tuned threshold was supplied, allow smoothing for F1 metrics
+        p_for_thr = _median_smooth_1d(p1, smooth_k)
+        thr = float(threshold)
+
+    yhat = (p_for_thr >= thr).astype(int)
+
     out = dict(
-    acc=float(accuracy_score(y, yhat)),
-    bal_acc=float(balanced_accuracy_score(y, yhat)),
-    macro_f1=float(f1_score(y, yhat, average='macro', zero_division=0)),
-    coverage_batches=len(loader),
-    auc=float(roc_auc_score(y, p1)) if len(np.unique(y)) > 1 else None,
+        acc=float(accuracy_score(y, yhat)),
+        bal_acc=float(balanced_accuracy_score(y, yhat)),
+        macro_f1=float(f1_score(y, yhat, average='macro', zero_division=0)),
+        coverage_batches=len(loader),
+        auc=float(roc_auc_score(y, p1)) if len(np.unique(y)) > 1 else None,  # RAW probs for AUC
     )
-    if return_probs: out.update({'probs': p1, 'y': y})
+    if return_probs:
+        out.update({'probs': p1, 'y': y})
     return out
     '''
     model.eval()
@@ -3271,7 +3291,8 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
         try:
             te_logits, ty = evaluate_logits(model, dl_te, device=device)
             tp   = eval_prob_fn(te_logits)
-            yhat = (tp >= t_star).astype(int)
+            tp_smooth = _medfilt(tp, k=5)
+            yhat = (tp_smooth >= t_star).astype(int)
             _te_avg = _choose_avg(ty)  # or 'binary'
             test_f1        = f1_score(ty, yhat, average=_te_avg, zero_division=0)
             test_precision = precision_score(ty, yhat, average=_te_avg, zero_division=0)
@@ -4958,7 +4979,8 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         try:
             te_logits, ty = evaluate_logits(model, dl_te, device=device)
             tp = eval_prob_fn(te_logits)
-            yhat = (tp >= t_star).astype(int)
+            tp_smooth = _medfilt(tp, k=5)
+            yhat = (tp_smooth >= t_star).astype(int)
             test_f1 = f1_score(ty, yhat)
         except Exception:
             pass
@@ -5411,7 +5433,8 @@ def run_one(spec):
 
     te_logits, ty = eval_logits(model, dl_te, device=DEVICE)
     tp = eval_prob_fn(te_logits)
-    yhat = (tp >= t_star).astype(int)
+    tp_smooth = _medfilt(tp, k=5)
+    yhat = (tp_smooth >= t_star).astype(int)
 
     metrics = ec57_metrics_with_ci(ty, yhat)
     cm = confusion_matrix(ty, yhat).tolist()
@@ -5941,13 +5964,31 @@ def eval_prob_fn(logits_np):
 
 
 
-def tune_threshold(y_true, p1, grid=THRESH_GRID, average='macro'):
-    """Find optimal threshold for binary classification"""
+def _median_smooth_1d(p, k: int | None = None):
+    """Small, fast median smoother for 1D numpy arrays (no SciPy needed)."""
+    if not k or k <= 1: 
+        return p
+    k = int(k)
+    k = k if k % 2 == 1 else k + 1   # force odd
+    pad = k // 2
+    x = np.pad(np.asarray(p), (pad, pad), mode="edge")
+    # sliding window view (NumPy >= 1.20). If older NumPy, replace with a simple loop.
+    sw = np.lib.stride_tricks.sliding_window_view(x, k)  # shape (N, k)
+    return np.median(sw, axis=-1)
+
+def tune_threshold(y_true, p1, grid=THRESH_GRID, average='macro', smooth_k: int | None = None):
+    """
+    Find t* on validation. If smooth_k is set (e.g., 5), we smooth p1 first.
+    Return (t_star, best_f1).
+    """
+    from sklearn.metrics import f1_score
+    p_use = _median_smooth_1d(p1, smooth_k)
     best_t, best_f1 = 0.5, -1.0
     for t in grid:
-        yhat = (p1 >= t).astype(int)
+        yhat = (p_use >= t).astype(int)
         f1 = f1_score(y_true, yhat, average=average, zero_division=0)
-        if f1 > best_f1: best_f1, best_t = f1, t
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
     return float(best_t), float(best_f1)
 
 # ===================== METRICS + CI, SIZE, LATENCY =====================
@@ -6648,19 +6689,6 @@ def _standardize_1d(x, eps: float = 1e-6):
     sd = x.std(dim=-1, keepdim=True).clamp_min(eps)
     return (x - mu) / sd
 
-def eval_classifier_plus(model, loader, device, return_probs=False):
-    logits, y = eval_logits(model, loader, device)
-    p1 = eval_prob_fn(logits)
-    yhat = (p1 >= 0.5).astype(int)
-    out = dict(
-    acc=float(accuracy_score(y, yhat)),
-    bal_acc=float(balanced_accuracy_score(y, yhat)),
-    macro_f1=float(f1_score(y, yhat, average='macro', zero_division=0)),
-    coverage_batches=len(loader),
-    auc=float(roc_auc_score(y, p1)) if len(np.unique(y)) > 1 else None,
-    )
-    if return_probs: out.update({'probs': p1, 'y': y})
-    return out
     '''
     model.eval()
     y_true, y_pred, y_prob = [], [], []
