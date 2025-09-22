@@ -98,7 +98,7 @@ def main():
     datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
 
     # Register only what you’ll run
-    register_dataset('apnea_ecg', _apnea_gcs_wrapper)
+    if "apnea_ecg" in datasets: register_dataset('apnea_ecg', _apnea_gcs_wrapper)
     if "ptbxl" in datasets: register_dataset('ptbxl', _ptbxl_gcs_wrapper)
     if "mitdb" in datasets: register_dataset('mitdb', _mitdb_gcs_wrapper)
 
