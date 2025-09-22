@@ -5017,28 +5017,100 @@ def plot_pareto(df: pd.DataFrame, x='flash_kb', y='test_f1_at_t', save_path='par
     return pf
 
 # ---------- Build unified model grid (incl. ablations & KD variants) ----------
+from itertools import product
+
 def build_model_grid_for_dataset(ds_key: str):
+    """
+    Balanced 21-run suite (per dataset):
+      - tiny_method: (dz,dh) in {(4,12),(6,16)} × KD∈{False,True} × bits∈{8,6}, focal=True  -> 8
+      - tiny_vae_head: KD∈{False,True} × bits∈{8,6}, focal=True                           -> 4
+      - cnn3_small, resnet1d_small, tiny_separable_cnn, regular_cnn: KD=False, bits∈{8,6} -> 8
+      - hrv_featnet: KD=False                                                             -> 1
+      Total = 21 runs per dataset.
+    """
     grid = []
-    # Core baselines
-    grid += [
-        dict(name='hrv_featnet',     kwargs={}),
-        dict(name='cnn3_small',      kwargs={'base':16}),
-        dict(name='resnet1d_small',  kwargs={'base':16}),
-        dict(name='tiny_separable_cnn', kwargs={}),
-        dict(name='tiny_method',     kwargs={'dz':4, 'dh':12}),
-        dict(name='tiny_method',     kwargs={'dz':6, 'dh':16}),  # allSynth-ish
-        dict(name='regular_cnn',     kwargs={}),
-    ]
-    # Generator variant (if supported by your TinyMethod)
-    grid += [dict(name='tiny_method', kwargs={'dz':6, 'dh':16, 'r':4, 'use_generator':True})]
-    # KD variants of tiny baselines
-    kd_variants = [
-        dict(name='tiny_separable_cnn', kwargs={}, kd=True),
-        dict(name='tiny_method', kwargs={'dz':4, 'dh':12}, kd=True),
-        dict(name='tiny_method', kwargs={'dz':6, 'dh':16}, kd=True),
-    ]
-    grid += kd_variants
+
+    EPOCHS = 8
+    LR     = 2e-3
+    BITS   = [8, 6]
+    FOCAL  = True
+
+    def add(model: str, kd: bool, kwargs: dict, tag: str = ""):
+        # one spec entry in the shape run_one() expects
+        spec = {
+            'name': f"{ds_key}+{model}{tag}",
+            'dataset': ds_key,
+            'model': model,
+            'epochs': EPOCHS,
+            'lr': LR,
+            'kd': kd,
+            'kwargs': kwargs.copy(),
+        }
+        grid.append(spec)
+
+    # ---------- TinyMethod (8 runs) ----------
+    for (dz, dh), kd, q in product([(4,12), (6,16)], [False, True], BITS):
+        add(
+            model='tiny_method',
+            kd=kd,
+            kwargs={
+                # model-specific
+                'dz': dz, 'dh': dh,
+                # training knobs (read by run_one)
+                'use_focal': FOCAL,
+                'qat_bits': q, 'qat_start_frac': 0.5,
+                'kd_alpha': 0.65, 'kd_temp': 3.5,
+                'feat_loss_weight': 0.10,
+                # include both names so size/registry mappers are happy
+                'quant_bits': q, 'qbits': q,
+            },
+            tag=f"-dz{dz}-dh{dh}-b{q}-{'kd' if kd else 'nokd'}"
+        )
+
+    # ---------- TinyVAE-Head (4 runs) ----------
+    for kd, q in product([False, True], BITS):
+        add(
+            model='tiny_vae_head',
+            kd=kd,
+            kwargs={
+                'use_focal': FOCAL,
+                'qat_bits': q, 'qat_start_frac': 0.5,
+                'kd_alpha': 0.65, 'kd_temp': 3.5,
+                'quant_bits': q, 'qbits': q,
+            },
+            tag=f"-b{q}-{'kd' if kd else 'nokd'}"
+        )
+
+    # ---------- Compact CNNs + Regular (8 runs total, KD=False) ----------
+    for q in BITS:
+        add('cnn3_small', kd=False, kwargs={
+            'base': 16,
+            'use_focal': FOCAL,
+            'quant_bits': q, 'qbits': q,
+        }, tag=f"-b{q}")
+        add('resnet1d_small', kd=False, kwargs={
+            'base': 16,
+            'use_focal': FOCAL,
+            'quant_bits': q, 'qbits': q,
+        }, tag=f"-b{q}")
+        add('tiny_separable_cnn', kd=False, kwargs={
+            'base_filters': 16, 'n_blocks': 2,
+            'use_focal': FOCAL,
+            'quant_bits': q, 'qbits': q,
+        }, tag=f"-b{q}")
+        add('regular_cnn', kd=False, kwargs={
+            'use_focal': FOCAL,
+            'quant_bits': q, 'qbits': q,
+        }, tag=f"-b{q}")
+
+    # ---------- HRV baseline (1 run) ----------
+    add('hrv_featnet', kd=False, kwargs={
+        'fs': 100.0, 'use_focal': FOCAL
+    }, tag="")
+
+    print(f"[grid] {ds_key}: planned {len(grid)} runs (balanced suite)")
     return grid
+
 
 def resource_penalty(model: nn.Module, meta: dict, w_size: float = 0.0, w_macs: float = 0.0):
     # L1 on learnable params (encourages sparsity / smaller effective size)
@@ -9841,14 +9913,26 @@ def fake_quant(x, bits=8):
     return xq * scale
 
 
-def kd_loss(student_logits, teacher_logits, T=2.0, alpha=0.7):
-    # KL(student||teacher) at temperature T
-    p_t = torch.softmax(teacher_logits / T, dim=1)
-    log_p_s = torch.log_softmax(student_logits / T, dim=1)
-    kl = torch.sum(p_t * (torch.log(p_t + 1e-8) - log_p_s), dim=1).mean()
-    return alpha * (T*T) * kl
+def kd_loss(student_logits, teacher_logits, T: float):
+    # KL(student || teacher) with temperature
+    ps = F.log_softmax(student_logits / T, dim=1)
+    pt = F.softmax(teacher_logits / T, dim=1)
+    return F.kl_div(ps, pt, reduction="batchmean") * (T*T)
 
+@torch.no_grad()
+def _maybe_teacher_outputs(teacher, xb):
+    teacher.eval()
+    return teacher(xb)
 
+def _best_threshold_macro_f1(y_true, p1, grid=None):
+    grid = grid or np.linspace(0.05, 0.95, 19)
+    best_t, best_f1 = 0.5, 0.0
+    for t in grid:
+        yhat = (p1 >= t).astype(int)
+        f1 = f1_score(y_true, yhat, average="macro", zero_division=0)
+        if f1 > best_f1: best_f1, best_t = f1, t
+    return best_t, best_f1
+	
 def bitaware_reg(student_logits, bits=8, beta=0.1):
     q = fake_quant(student_logits, bits=bits)
     return beta * torch.mean((student_logits - q)**2)
@@ -9935,7 +10019,20 @@ def _ensure_meta(meta: Dict, dl_tr):
 # One run with optional KD, periodic threshold-aware val metrics, and JSON output
 
 def run_one(spec):
+    """
+    spec keys expected:
+      - 'name': str (experiment id)
+      - 'dataset': str ('apnea_ecg' | 'ptbxl' | 'mitdb')
+      - 'model': str (e.g., 'tiny_method', 'resnet1d_small', ...)
+      - 'epochs': int
+      - 'lr': float
+      - 'kd': bool
+      - 'kwargs': dict  <-- per-model/training knobs (dz, dh, use_focal, qat_bits, kd_alpha, kd_temp, ...)
+    """
     name, ds_key = spec['name'], spec['dataset']
+    model_name   = spec.get('model', spec.get('name'))  # keep backward-compat
+    model_kwargs = dict(spec.get('kwargs', {}))         # <-- READ KWARGS HERE
+
     if RUN_ONCE and already_done(name):
         print(f"[SKIP] {name} (cached)")
         return
@@ -9946,6 +10043,15 @@ def run_one(spec):
     print(f" Dataset meta: {meta}")
     print(f" Train batches: {len(dl_tr)}, Val batches: {len(dl_va)}")
 
+    # ---- training knobs (with defaults) pulled from spec['kwargs'] ----
+    kd_alpha       = float(model_kwargs.get("kd_alpha", 0.65))
+    kd_temp        = float(model_kwargs.get("kd_temp", 3.5))
+    feat_w         = float(model_kwargs.get("feat_loss_weight", 0.0))
+    qat_start_frac = float(model_kwargs.get("qat_start_frac", 0.5))
+    qat_bits       = int(model_kwargs.get("qat_bits", 6))
+    ema_decay      = float(model_kwargs.get("ema_decay", 0.999))
+    use_focal      = bool(model_kwargs.get("use_focal", True))
+
     # ----- optional KD teacher -----
     teacher = None
     if spec.get('kd', False):
@@ -9953,82 +10059,113 @@ def run_one(spec):
         try:
             in_ch = meta.get('num_channels', 1)
             num_classes = meta.get('num_classes', 2)
-            # build safe & swap BN→GN
+            # teacher: larger reference; BN->GN handled inside safe_build_model (your version does this)
             teacher = safe_build_model("regular_cnn", in_ch, num_classes).to(DEVICE)
         except Exception as e:
             print(f"  Teacher build failed: {e} (continuing without KD)")
             teacher = None
-        '''
+
+        # (Optional) warm up the teacher briefly if you don't have a checkpoint
         if teacher is not None:
             t_opt = torch.optim.AdamW(teacher.parameters(), lr=spec['lr'])
-            t_epochs = max(3, DATASET_SPECS[ds_key]['epochs']//2)
+            t_epochs = max(3, DATASET_SPECS[ds_key]['epochs'] // 2)
             for _ in range(t_epochs):
-                train_fn = globals().get('train_epoch', train_epoch_ce)
-                _ = train_fn(teacher, dl_tr, t_opt, device=DEVICE)  # ensure your train_epoch signature accepts device
+                _ = train_epoch_ce(teacher, dl_tr, t_opt, device=DEVICE, meta=meta,
+                                   w_size=0.0, w_spec=0.0, w_softf1=0.0)  # quick CE warmup
             print(" Teacher ready.")
-        '''
-        if teacher is not None:
-          t_opt = torch.optim.AdamW(teacher.parameters(), lr=spec['lr'])
-          t_epochs = max(3, DATASET_SPECS[ds_key]['epochs']//2)
-          for _ in range(t_epochs):
-              # use the CE trainer; no resource/spec/F1 on the teacher
-              _ = train_epoch_ce(teacher, dl_tr, t_opt, device=DEVICE, meta=meta,
-                                w_size=0.0, w_spec=0.0, w_softf1=0.0)
-          print(" Teacher ready.")
+
     # ----- student model -----
-    print(f" Building student model: {spec['model']}")
+    print(f" Building student model: {model_name}  kwargs={model_kwargs}")
     in_ch = meta.get('num_channels', 1)
     num_classes = meta.get('num_classes', 2)
     try:
-        model = safe_build_model(spec['model'], in_ch, num_classes).to(DEVICE)
+        # PASS KWARGS INTO THE BUILDER
+        model = safe_build_model(model_name, in_ch, num_classes, **model_kwargs).to(DEVICE)
     except Exception as e:
         print(f"  Student build failed: {e}")
         save_json(name, {'status': 'failed_build', 'error': str(e), 'meta': meta})
         return
 
     opt = torch.optim.AdamW(model.parameters(), lr=spec['lr'])
-
-    # choose trainer (your custom if present)
+    # choose trainer (fallback to CE trainer if your custom isn't present)
     train_fn = globals().get('train_epoch', train_epoch_ce)
 
-    # ----- training -----
+    # ----- training loop with QAT toggle + EMA -----
     print(f" Training for {spec['epochs']} epochs...")
     best = (-1.0, None, None)  # (val_f1, t_star, state_dict)
     w_size   = 1.0                       # resource (L1) pressure on student
-    w_bit    = 0.05 if teacher else 0.0  # bit-aware KD only matters when KD is on
+    w_bit    = 0.05 if teacher else 0.0  # bit-aware KD weight only when KD is on
     w_spec   = 1e-4                      # spectral leakage penalty (very light)
-    w_softf1 = 0.10                      # soft-F1 auxiliary (imbalance-friendly)
+    w_softf1 = 0.10                      # soft-F1 auxiliary
+
+    # simple EMA over epochs (per-step EMA would be stronger, but this is minimal-intrusion)
+    ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
     for ep in range(spec['epochs']):
-      if teacher is not None:
-          tr_loss = kd_train_epoch(student=model, teacher=teacher, loader=dl_tr, opt=opt,
-                              T=2.0, alpha=0.7, device=DEVICE, meta=meta, clip=1.0,
-                              w_size=w_size, w_bit=w_bit, w_spec=w_spec, w_softf1=w_softf1)
-      else:
-          tr_loss = train_epoch_ce(model, dl_tr, opt, device=DEVICE, meta=meta, clip=1.0,
-                              w_size=w_size, w_spec=w_spec, w_softf1=w_softf1)
+        # QAT: enable halfway through training if model exposes set_qat/clear_qat
+        if hasattr(model, "set_qat"):
+            if ep >= int(qat_start_frac * spec['epochs']):
+                model.set_qat(qat_bits)
+            else:
+                model.clear_qat()
 
-    # occasional val read-out (thresholded F1)
-    if (ep + 1) % max(1, spec['epochs'] // 3) == 0:
-        v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
-        vp = eval_prob_fn(v_logits)
-        t_star, val_f1 = tune_threshold(vy, vp, THRESH_GRID)
-        if val_f1 > best[0]:
-            best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
-        val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
-        print(f"{name} ep{ep+1}/{spec['epochs']}  tr_loss={tr_loss:.4f}  "
-              f"val_acc@t*={val_acc:.3f}  val_f1@t*={val_f1:.3f}  t*={t_star:.2f}")
+        # KD or plain CE epoch
+        if teacher is not None:
+            tr_loss = kd_train_epoch(
+                student=model, teacher=teacher, loader=dl_tr, opt=opt,
+                T=kd_temp, alpha=kd_alpha, device=DEVICE, meta=meta, clip=1.0,
+                w_size=w_size, w_bit=w_bit, w_spec=w_spec, w_softf1=w_softf1,
+            )
+            # optional: feature hint if your kd_train_epoch doesn't handle it
+            if feat_w > 0 and hasattr(model, "_forward_features") and hasattr(teacher, "_forward_features"):
+                # quick extra pass for hinting (cheap approximation)
+                model.train()
+                xb, yb = next(iter(dl_tr))
+                xb = xb.to(DEVICE)
+                with torch.no_grad():
+                    t_feat = teacher._forward_features(xb)  # type: ignore[attr-defined]
+                s_feat = model._forward_features(xb)        # type: ignore[attr-defined]
+                hint_loss = F.mse_loss(s_feat, t_feat) * feat_w
+                opt.zero_grad(set_to_none=True)
+                hint_loss.backward()
+                opt.step()
+        else:
+            tr_loss = train_epoch_ce(
+                model, dl_tr, opt, device=DEVICE, meta=meta, clip=1.0,
+                w_size=w_size, w_spec=w_spec, w_softf1=w_softf1,
+            )
 
-    # ----- final eval (tuned on val) -----
+        # EMA update (epoch-level)
+        with torch.no_grad():
+            for k, v in model.state_dict().items():
+                ema_state[k].mul_(ema_decay).add_(v.detach(), alpha=(1.0 - ema_decay))
+
+        # occasional val read-out (thresholded F1) — keep this INSIDE the loop
+        if (ep + 1) % max(1, spec['epochs'] // 3) == 0 or (ep + 1) == spec['epochs']:
+            v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
+            vp = eval_prob_fn(v_logits)
+            t_star, val_f1 = tune_threshold(vy, vp, THRESH_GRID)
+            if val_f1 > best[0]:
+                best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
+            val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
+            print(f"{name} ep{ep+1}/{spec['epochs']}  tr_loss={tr_loss:.4f}  "
+                  f"val_acc@t*={val_acc:.3f}  val_f1@t*={val_f1:.3f}  t*={t_star:.2f}")
+
+    # ----- final eval (swap to EMA for eval) -----
+    with torch.no_grad():
+        raw_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(ema_state, strict=False)
+
+    # choose best val state if it beat EMA snapshot
     v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
     vp = eval_prob_fn(v_logits)
     t_star, val_f1 = tune_threshold(vy, vp, THRESH_GRID)
-    if val_f1 > best[0]:
-        best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
-
-    if best[2] is not None:
+    if best[0] >= val_f1 and best[2] is not None:
         model.load_state_dict(best[2])
-    t_star = best[1]
+        t_star = best[1]
+        val_f1 = best[0]
 
+    # test
     te_logits, ty = eval_logits(model, dl_te, device=DEVICE)
     tp = eval_prob_fn(te_logits)
     yhat = (tp >= t_star).astype(int)
@@ -10052,6 +10189,7 @@ def run_one(spec):
     save_json(name, payload)
     print_and_log(name, payload)
     print(f" Success: {name}")
+
 
 
 
