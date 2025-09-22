@@ -264,36 +264,49 @@ class PWHead(nn.Module):
 # ============================================================
 # Core Architectures
 # ============================================================
-
+def _fake_quant_per_tensor(x: torch.Tensor, nbits: int) -> torch.Tensor:
+    """Symmetric fake-quant in training; pass-through in eval."""
+    if nbits is None or nbits >= 32: 
+        return x
+    # avoid degenerate ranges
+    xmax = x.detach().abs().amax()
+    scale = (xmax / (2**(nbits-1)-1)).clamp(min=1e-8)
+    q = torch.clamp(torch.round(x / scale), min=-(2**(nbits-1)), max=(2**(nbits-1)-1))
+    return q * scale
+	
 @_register_model()
 class SharedCoreSeparable1D(nn.Module):
     """
-    Enhanced model with:
-    - Multi-scale stem
-    - Depthwise-separable stages (last PW synthesized)
-    - Attention-weighted pooling
+    TinyMethod (ours): multi-scale stem + depthwise blocks; final PW is synthesized
+    from a compact latent (generator). Adds optional QAT fake-quant for features & PW.
     """
-    def __init__(self, in_ch=1, base=16, num_classes=2, latent_dim=16, input_length=1800, hybrid_keep=1):
+    def __init__(self, in_ch=1, base=16, num_classes=2, latent_dim=16, input_length=1800,
+                 hybrid_keep=1,  # kept for API parity
+                 qat_bits: int | None = None):  # <-- NEW: can be set at build or via set_qat()
         super().__init__()
         self.base = base
+        self.qat_bits = qat_bits  # if None, disabled until set_qat() is called
 
+        # Stem
         self.stem = nn.Sequential(
             MultiScaleFeatures(in_ch, base),
             nn.MaxPool1d(2, 2)
         )
 
+        # Two regular DS blocks + one where PW is synthesized
         self.blocks = nn.ModuleList([
-            DepthwiseSeparable1D(base, base*2, k=5, stride=2, use_se=True, use_residual=False),
-            DepthwiseSeparable1D(base*2, base*2, k=5, stride=1, use_se=True, use_residual=True),
-            DepthwiseSeparable1D(base*2, base*4, k=5, stride=2, use_se=True, use_residual=False),
+            DepthwiseSeparable1D(base,   base*2, k=5, stride=2, use_se=True,  use_residual=False),
+            DepthwiseSeparable1D(base*2, base*2, k=5, stride=1, use_se=True,  use_residual=True),
+            DepthwiseSeparable1D(base*2, base*4, k=5, stride=2, use_se=True,  use_residual=False),
         ])
 
+        # Latent → weight generator for the last PW conv
         self.gen = SharedPWGenerator(z_dim=latent_dim, hidden=96)
         self.last_pw_out = base*4
         self.last_pw_in  = base*2
-        last_pw_shape = (self.last_pw_out, self.last_pw_in, 1)
-        self.pw_head = PWHead(h_dim=96, flat_out=int(np.prod(last_pw_shape)))
+        self.pw_head = PWHead(h_dim=96, flat_out=int(self.last_pw_out*self.last_pw_in*1))
 
+        # Lightweight attention pooling
         self.att_weight = nn.Sequential(
             nn.Conv1d(base*4, max(1, base//4), 1),
             nn.ReLU(inplace=True),
@@ -304,7 +317,7 @@ class SharedCoreSeparable1D(nn.Module):
         feat_dim = base * 4
         self.head = nn.Sequential(
             nn.Linear(feat_dim, 64), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(64, 32), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(64, 32),      nn.ReLU(), nn.Dropout(0.1),
             nn.Linear(32, num_classes)
         )
         for m in self.head.modules():
@@ -313,23 +326,33 @@ class SharedCoreSeparable1D(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
+    # --- QAT helpers ---
+    def set_qat(self, nbits: int):     self.qat_bits = int(nbits)
+    def clear_qat(self):               self.qat_bits = None
+
     def _synth_pw_weight(self):
         h = self.gen()
         w = self.pw_head(h).view(self.last_pw_out, self.last_pw_in, 1)
-        return torch.tanh(w) * 0.05  # keep small
+        # keep small magnitude for stability
+        w = torch.tanh(w) * 0.05
+        # fake-quant PW kernel if QAT is on
+        if self.training and self.qat_bits is not None:
+            w = _fake_quant_per_tensor(w, self.qat_bits)
+        return w
 
     def _forward_features(self, x):
+        # sanitize + standardize
         x = torch.nan_to_num(x)
         x = _standardize_1d(x)
-
         if self.training:
-            x = x + torch.randn_like(x) * 5e-7
+            x = x + torch.randn_like(x) * 5e-7  # tiny noise for robustness
 
-        x = self.stem(x); x = torch.nan_to_num(x)
-        x = self.blocks[0](x); x = torch.nan_to_num(x)
-        x = self.blocks[1](x); x = torch.nan_to_num(x)
+        # stem + first two DS blocks
+        x = self.stem(x);           x = torch.nan_to_num(x)
+        x = self.blocks[0](x);      x = torch.nan_to_num(x)
+        x = self.blocks[1](x);      x = torch.nan_to_num(x)
 
-        # third block but with synthetic PW
+        # third block with synthesized PW
         b2 = self.blocks[2].dw(x)
         b2 = self.blocks[2].bn1(b2)
         b2 = self.blocks[2].act(b2)
@@ -337,13 +360,16 @@ class SharedCoreSeparable1D(nn.Module):
         w = self._synth_pw_weight()
         b2 = F.conv1d(b2, w, bias=None, stride=1, padding=0, groups=1)
         b2 = self.blocks[2].bn2(b2)
-        if self.blocks[2].se is not None:
-            b2 = self.blocks[2].se(b2)
+        if self.blocks[2].se is not None: b2 = self.blocks[2].se(b2)
         b2 = self.blocks[2].act(b2)
-        b2 = torch.nan_to_num(b2)
 
-        att = self.att_weight(b2)               # (B,1,T)
-        y = (b2 * att).sum(dim=-1) / (att.sum(dim=-1) + 1e-6)  # (B,C)
+        # attention pooling
+        att = self.att_weight(b2)                         # (B,1,T)
+        y   = (b2 * att).sum(dim=-1) / (att.sum(dim=-1) + 1e-6)  # (B,C)
+
+        # fake-quant pooled features if QAT is on
+        if self.training and self.qat_bits is not None:
+            y = _fake_quant_per_tensor(y, self.qat_bits)
         return torch.nan_to_num(y)
 
     def forward(self, x):
