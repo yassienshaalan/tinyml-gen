@@ -3734,7 +3734,7 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
 
         # epoch-level EMA update (kept for TEST)
         ema.update()
-        valm = _val_at_tstar(model, dl_va, device, ema=None, k=5, grid=THRESH_GRID,use_ema=False, debug=(ep < 2)
+        valm = _val_at_tstar(model, dl_va, device, ema=None, k=5, grid=THRESH_GRID,use_ema=False, debug=(ep < 2))
         if valm['f1'] > best['f1']:
             best.update(
                 f1=valm['f1'], t_star=valm['t_star'],
