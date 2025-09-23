@@ -1,7 +1,7 @@
 
 import os, sys, math, time, random
 from typing import Optional, List, Tuple, Dict
-
+import re 
 import numpy as np
 import pandas as pd
 import torch
@@ -96,6 +96,9 @@ def _bootstrap_ci_stat(fn, y_true, y_pred, p_raw=None, groups=None,
     lo = np.quantile(stats, alpha/2)
     hi = np.quantile(stats, 1 - alpha/2)
     return (float(lo), float(hi))
+
+def _print_eval_signature(stage, use_ema, k, t_star):
+    print(f"[EVAL] {stage}: EMA={'yes' if use_ema else 'no'} | median_k={k} | t* (from val)={t_star:.4f}")
 
 def _sens_spec(y_true, y_pred):
     # ensure consistent label order
@@ -3397,23 +3400,39 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
     dur = time.time() - start
 
     # ------------------ Final: restore best snapshot, evaluate TEST under EMA ------------------
+    # load best-val state if we captured one
     if best[2] is not None:
         model.load_state_dict(best[2])
-    t_star = best[1]
+    t_star = float(best[1])
+
+    # tiny helper (safe if not already defined)
+    try:
+        _print_eval_signature
+    except NameError:
+        def _print_eval_signature(stage, use_ema, k, t_star):
+            print(f"[EVAL] {stage}: EMA={'yes' if use_ema else 'no'} | median_k={k} | t* (from val)={t_star:.4f}")
+
+    # --- TEST using EMA params + median smoothing, threshold from VAL ---
     with ema.average_parameters(model):
-        te_logits, ty = eval_logits(model, dl_te, device=device)
+        _print_eval_signature("TEST", use_ema=True, k=5, t_star=t_star)
+        te_logits, ty = evaluate_logits(model, dl_te, device=device)
         tp_raw = eval_prob_fn(te_logits)
-    tp = _median_smooth_1d(tp_raw, k=5)
-    yhat = (tp >= t_star).astype(int)
+        tp = _median_smooth_1d(tp_raw, k=5)
+        yhat = (tp >= t_star).astype(int)
+        groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
+        metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
+        cm = confusion_matrix(ty, yhat).tolist()
 
-    test_acc = accuracy_score(ty, yhat)
-    test_f1  = f1_score(ty, yhat, average=_choose_avg(ty), zero_division=0)
-    test_precision = precision_score(ty, yhat, average=_choose_avg(ty), zero_division=0)
-    test_recall    = recall_score(ty, yhat, average=_choose_avg(ty), zero_division=0)
-    print(f" Test P/R/F1@t*: {test_precision:.3f}/{test_recall:.3f}/{test_f1:.3f}")
+    print(
+        f" New Test acc@t*={metrics['acc']:.4f} | macroF1@t*={metrics['macro_f1']:.4f} "
+        f"| balAcc@t*={(metrics.get('balanced_acc', float('nan'))):.4f} "
+        f"| AUC(raw)={metrics.get('auc_raw', None)}"
+    )
 
-    # Deploy profile
+    # Deploy profile (unchanged)
     deploy = deployment_profile(model, meta, flash_bytes_fn=_flash_bytes_int8, device=str(device))
+
+    # Build results (keeps old keys; adds richer test metrics + CIs + confusion matrix)
     results = {
         'dataset': dataset_name,
         'model': _normalize_model_name(model_name),
@@ -3424,13 +3443,23 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
 
         'val_acc': float(val_acc),
         'val_f1_at_t': float(best[0]),
-        'val_precision_at_t': float(precision_score(vy, (vp >= t_star).astype(int), average=_choose_avg(vy), zero_division=0)),
-        'val_recall_at_t': float(recall_score(vy, (vp >= t_star).astype(int), average=_choose_avg(vy), zero_division=0)),
+        'val_precision_at_t': float(precision_score(vy, (vp >= t_star).astype(int),
+                                                    average=_choose_avg(vy), zero_division=0)),
+        'val_recall_at_t': float(recall_score(vy, (vp >= t_star).astype(int),
+                                            average=_choose_avg(vy), zero_division=0)),
 
-        'test_acc': float(test_acc),
-        'test_f1_at_t': float(test_f1),
-        'test_precision_at_t': float(test_precision),
-        'test_recall_at_t': float(test_recall),
+        # NEW (thresholded, EMA, smoothed)
+        'test_acc': float(metrics['acc']),
+        'test_f1_at_t': float(metrics['macro_f1']),
+        'test_precision_at_t': float(metrics['precision_macro']),
+        'test_recall_at_t': float(metrics['recall_macro']),
+        'test_balanced_acc': float(metrics.get('balanced_acc', float('nan'))),
+        'test_auc_raw': (None if metrics.get('auc_raw', None) is None else float(metrics['auc_raw'])),
+        'test_acc_ci': metrics.get('acc_ci'),
+        'test_macro_f1_ci': metrics.get('macro_f1_ci'),
+        'test_balanced_acc_ci': metrics.get('balanced_acc_ci'),
+        'test_auc_raw_ci': metrics.get('auc_raw_ci'),
+        'test_cm': cm,
 
         'threshold_t': float(t_star),
         'params': int(count_params(model)),
@@ -3726,18 +3755,17 @@ def run_one(spec):
     t_star = best[1]
 
     with ema.average_parameters(model):
+        _print_eval_signature("TEST", use_ema=True, k=5, t_star=t_star)
         te_logits, ty = eval_logits(model, dl_te, device=DEVICE)
         tp_raw = eval_prob_fn(te_logits)
-
-    tp = _median_smooth_1d(tp_raw, k=5)
-    yhat = (tp >= t_star).astype(int)
-
-    groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
-    metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
-    cm = confusion_matrix(ty, yhat).tolist()
-    print(f" New Test acc@t*={metrics['acc']:.4f} | macroF1@t*={metrics['macro_f1']:.4f} "
-          f"| balAcc@t*={metrics.get('balanced_acc', float('nan')):.4f} "
-          f"| AUC(raw)={metrics.get('auc_raw', None)}")
+        tp = _median_smooth_1d(tp_raw, k=5)
+        yhat = (tp >= t_star).astype(int)
+        groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
+        metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
+        cm = confusion_matrix(ty, yhat).tolist()
+        print(f" New Test acc@t*={metrics['acc']:.4f} | macroF1@t*={metrics['macro_f1']:.4f} "
+            f"| balAcc@t*={metrics.get('balanced_acc', float('nan')):.4f} "
+            f"| AUC(raw)={metrics.get('auc_raw', None)}")
 
     # Size & latency
     packed = packed_bytes_model_paper(model)
