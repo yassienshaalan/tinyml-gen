@@ -3783,7 +3783,7 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
     metrics_ema, cm_ema = _test_at_tstar(
         model, dl_te, device, t_star=t_star_ema, k=5, ema_ctx=ema.average_parameters(model), stage="EMA"
     )
-
+    
     # Print branch summaries
     print(
         f"[SUMMARY RAW] Test acc@t*={metrics_raw['acc']:.4f} "
@@ -3803,7 +3803,7 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
     metrics, cm = (metrics_ema, cm_ema) if use_ema else (metrics_raw, cm_raw)
     t_star      = float(t_star_ema if use_ema else t_star_raw)
     chosen      = "EMA" if use_ema else "RAW"
-    test_pos_rate = float(pos_rate_ema if use_ema else pos_rate_raw)
+    #test_pos_rate = float(pos_rate_ema if use_ema else pos_rate_raw)
 
     print(
         f" New Test acc@t*={metrics['acc']:.4f} "
@@ -3867,7 +3867,7 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         'test_branch': 'EMA' if use_ema else 'RAW',
         't_star_raw': float(t_star_raw),
         't_star_ema': float(t_star_ema),
-        'test_pos_rate': float(test_pos_rate),
+        #'test_pos_rate': float(test_pos_rate),
 
         # (Optional but handy for audits)
         'raw_test_acc': float(metrics_raw['acc']),
