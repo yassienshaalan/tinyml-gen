@@ -3614,6 +3614,209 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str] = None):
         print(df[cols].to_string(index=False, float_format='%.4f'))
     return df
 
+def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=False,
+                           w_size=1.0, w_bit=0.05, w_spec=1e-4, w_softf1=0.10,
+                           loaders=None):
+    """
+    Unified training + threshold-tuned evaluation (EMA + median smoothing).
+    No legacy 'Test accuracy:' print.
+    """
+    model_kwargs = model_kwargs or {}
+
+    # --- loaders / meta ---
+    if loaders is None:
+        ret = make_dataset_for_experiment(
+            dataset_name,
+            limit=cfg.limit,
+            batch_size=cfg.batch_size,
+            target_fs=cfg.target_fs,
+            num_workers=cfg.num_workers,
+            length=cfg.length,
+            window_ms=cfg.window_ms,
+            input_len=cfg.input_len,
+            seed=getattr(cfg, "seed", 42),
+        )
+        dl_tr, dl_va, dl_te, meta = _normalize_dataset_return(ret)
+    else:
+        dl_tr, dl_va, dl_te, meta = loaders
+
+    print(f'\n{"="*60}\n Experiment: {dataset_name} + {model_name}\n{"="*60}')
+
+    # Probe meta if needed
+    need_probe = ("num_channels" not in meta) or ("num_classes" not in meta) or ("seq_len" not in meta)
+    if need_probe:
+        xb, yb = next(iter(dl_tr))
+        meta.setdefault("num_channels", int(xb.shape[1]))     # (B, C, T)
+        meta.setdefault("seq_len",     int(xb.shape[-1]))
+        if yb.ndim == 1:
+            meta.setdefault("num_classes", int(max(2, yb.max().item() + 1)))
+        elif yb.ndim == 2:
+            meta.setdefault("num_classes", int(yb.shape[1]))
+        else:
+            meta.setdefault("num_classes", 2)
+
+    print(f" Dataset meta: {meta}")
+    print(f" Train batches: {len(dl_tr)}, Val batches: {len(dl_va)}")
+
+    device = torch.device(cfg.device)
+    in_ch  = meta['num_channels']
+    ncls   = meta['num_classes']
+
+    # --- optional KD teacher ---
+    teacher = None
+    if kd:
+        try:
+            teacher = safe_build_model("regular_cnn", in_ch, ncls).to(device)
+            t_opt = torch.optim.AdamW(teacher.parameters(), lr=cfg.lr)
+            t_epochs = max(3, (cfg.epochs // 2))
+            for _ in range(t_epochs):
+                _ = train_epoch_ce(teacher, dl_tr, t_opt, device=device, meta=meta,
+                                   w_size=0.0, w_spec=0.0, w_softf1=0.0)
+            print(" Teacher ready.")
+        except Exception as e:
+            print(f" Teacher build failed: {e} (continuing without KD)")
+            teacher = None
+
+    # --- student ---
+    model = safe_build_model(model_name, in_ch, ncls, **model_kwargs).to(device)
+
+    # --- EMA ---
+    ema_decay = float(model_kwargs.get("ema_decay", 0.999))
+    ema = ExponentialMovingAverage(model.parameters(), decay=ema_decay)
+    print(f"[EMA] decay={ema_decay}")
+
+    # --- optimizer ---
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+
+    # --- diagnostics (short) ---
+    try:
+        sample_x = next(iter(dl_tr))[0][:1].to(device)
+        diagnose_nan_issues(model, sample_x, device)
+        fix_nan_issues(model)
+    except Exception:
+        pass
+
+    # Helper: fast val acc without printing
+    def _quick_val_acc(m, loader, dev):
+        v_logits, vy = eval_logits(m, loader, device=dev)  # returns np arrays
+        if v_logits.ndim > 1:
+            v_pred = v_logits.argmax(axis=1)
+        else:
+            v_pred = (v_logits >= 0.5).astype(int)
+        return float(accuracy_score(vy, v_pred))
+
+    # --- train loop ---
+    best_val_acc = 0.0
+    best_state = None
+    start = time.time()
+    for ep in range(cfg.epochs):
+        if teacher is not None:
+            tr_loss = kd_train_epoch(
+                student=model, teacher=teacher, loader=dl_tr, opt=opt,
+                device=device, meta=meta,
+                w_size=w_size, w_bit=w_bit, w_spec=w_spec, w_softf1=w_softf1
+            )
+        else:
+            tr_loss = train_epoch_ce(
+                model, dl_tr, opt, device=device, meta=meta,
+                w_size=w_size, w_spec=w_spec, w_softf1=w_softf1
+            )
+
+        # epoch-level EMA update (simple but effective)
+        ema.update()
+
+        # silent val-acc (no legacy prints)
+        val_acc = _quick_val_acc(model, dl_va, device)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        print(f'  Epoch {ep+1}/{cfg.epochs}: train_loss={tr_loss:.4f} val_acc={val_acc:.4f}')
+
+    # restore best-val weights
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    dur = time.time() - start
+
+    # --- Threshold tuning on VAL (EMA weights) ---
+    with ema.average_parameters(model):
+        v_logits, vy = eval_logits(model, dl_va, device=device)
+        vp = eval_prob_fn(v_logits)
+        vp_smooth = _median_smooth_1d(vp, k=5)
+        try:
+            t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
+        except Exception:
+            t_star, val_f1 = 0.5, float('nan')
+
+    # --- TEST (EMA weights + same t*, median smoothing) ---
+    print(f"[EVAL] TEST: EMA=yes | median_k=5 | t* (from val)={t_star:.4f}")
+    with ema.average_parameters(model):
+        te_logits, ty = eval_logits(model, dl_te, device=device)
+        tp_raw = eval_prob_fn(te_logits)
+        tp = _median_smooth_1d(tp_raw, k=5)
+        yhat = (tp >= t_star).astype(int)
+        groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
+        metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
+        cm = confusion_matrix(ty, yhat).tolist()
+
+    print(
+        f" New Test acc@t*={metrics['acc']:.4f} "
+        f"| macroF1@t*={metrics['macro_f1']:.4f} "
+        f"| P/R(macro)@t*={metrics['precision_macro']:.4f}/{metrics['recall_macro']:.4f} "
+        f"| balAcc@t*={(metrics.get('balanced_acc', float('nan'))):.4f} "
+        f"| AUC(raw)={metrics.get('auc_raw', None)}"
+    )
+
+    # --- deployment profile ---
+    def _flash_bytes_int8(m):
+        try: return estimate_flash_usage(m, 'int8')["flash_bytes"]
+        except: return sum(p.numel() for p in m.parameters())
+    deploy = deployment_profile(model, meta, flash_bytes_fn=_flash_bytes_int8, device=str(device))
+
+    params = count_params(model)
+    print(f" Best val acc: {best_val_acc:.4f} | Val F1@t*: {val_f1 if not np.isnan(val_f1) else float('nan'):.3f}")
+    print(f" Training time: {dur:.1f}s | Flash: {deploy['flash_kb']:.2f} KB")
+
+    return {
+        'dataset': dataset_name,
+        'model': _normalize_model_name(model_name),
+        'model_kwargs': model_kwargs,
+        'kd': kd,
+        'epochs': cfg.epochs,
+        'lr': cfg.lr,
+
+        'val_acc': float(best_val_acc),
+        'val_f1_at_t': float(val_f1),
+
+        # new test metrics
+        'test_acc': float(metrics['acc']),
+        'test_f1_at_t': float(metrics['macro_f1']),
+        'test_precision_at_t': float(metrics['precision_macro']),
+        'test_recall_at_t': float(metrics['recall_macro']),
+        'test_balanced_acc': float(metrics.get('balanced_acc', float('nan'))),
+        'test_auc_raw': (None if metrics.get('auc_raw', None) is None else float(metrics['auc_raw'])),
+        'test_acc_ci': metrics.get('acc_ci'),
+        'test_macro_f1_ci': metrics.get('macro_f1_ci'),
+        'test_balanced_acc_ci': metrics.get('balanced_acc_ci'),
+        'test_auc_raw_ci': metrics.get('auc_raw_ci'),
+        'test_cm': cm,
+
+        'threshold_t': float(t_star),
+        'params': int(params),
+        'flash_kb': float(deploy['flash_kb']),
+        'ram_act_peak_kb': float(deploy['ram_act_peak_kb']),
+        'param_kb': float(deploy['param_kb']),
+        'buffer_kb': float(deploy['buffer_kb']),
+        'macs': int(deploy['macs']),
+        'latency_ms': deploy['latency_ms'],
+        'energy_mJ': deploy['energy_mJ'],
+        'train_time_s': float(dur),
+        'channels': meta.get('num_channels', None),
+        'seq_len': meta.get('seq_len', None),
+        'num_classes': meta.get('num_classes', None),
+    }
+
+
 def run_one(spec):
     """
     One spec dict:
@@ -5241,167 +5444,6 @@ def print_class_dist_from_loaders(dl_tr, dl_va, dl_te, meta, max_samples=2000):
         print(f"  counted samples : {total}  (limit={max_samples})")
         for k in sorted(c): print(f"  class {k}: {c[k]} ({c[k]*100.0/total:.2f}%)")
         print("========================================")
-
-# ---------- Unified run_experiment (now supports model_kwargs + kd + weights) ----------
-def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=False,
-                           w_size=1.0, w_bit=0.05, w_spec=1e-4, w_softf1=0.10,
-                           loaders=None):
-    if loaders is None:
-        # fallback (but normally not used now)
-        ret = make_dataset_for_experiment(..., seed=getattr(cfg, "seed", 42))
-        dl_tr, dl_va, dl_te, meta = _normalize_dataset_return(ret)
-    else:
-        dl_tr, dl_va, dl_te, meta = loaders
-
-    print(f'\n{"="*60}\n Experiment: {dataset_name} + {model_name}\n{"="*60}')
-    model_kwargs = model_kwargs or {}
-
-    # --- loaders ---
-    try:
-        ret = make_dataset_for_experiment(
-            dataset_name,
-            limit=cfg.limit,
-            batch_size=cfg.batch_size,
-            target_fs=cfg.target_fs,
-            num_workers=cfg.num_workers,
-            length=cfg.length,
-            window_ms=cfg.window_ms,
-            input_len=cfg.input_len
-        )
-        #dl_tr, dl_va, dl_te, meta = _normalize_dataset_return(ret)
-        need_probe = ("num_channels" not in meta) or ("num_classes" not in meta) or ("seq_len" not in meta)
-        if need_probe:
-            xb, yb = next(iter(dl_tr))
-            meta.setdefault("num_channels", int(xb.shape[1]))
-            meta.setdefault("seq_len",     int(xb.shape[-1]))
-            if yb.ndim == 1:
-                meta.setdefault("num_classes", int(max(2, yb.max().item() + 1)))
-            elif yb.ndim == 2:
-                meta.setdefault("num_classes", int(yb.shape[1]))
-            else:
-                meta.setdefault("num_classes", 2)
-        print(f" Dataset meta: {meta}")
-        print(f" Train batches: {len(dl_tr)}, Val batches: {len(dl_va)}")
-    except Exception as e:
-        print(f'Failed to prepare dataset: {e}')
-        return None
-
-    device = torch.device(cfg.device)
-    in_ch  = meta['num_channels']
-    ncls   = meta['num_classes']
-
-    # --- teacher (optional) ---
-    teacher = None
-    if kd:
-        try:
-            teacher = safe_build_model("regular_cnn", in_ch, ncls).to(device)
-            t_opt = torch.optim.AdamW(teacher.parameters(), lr=cfg.lr)
-            t_epochs = max(3, (cfg.epochs // 2))
-            for _ in range(t_epochs):
-                _ = train_epoch_ce(teacher, dl_tr, t_opt, device=device, meta=meta,
-                                   w_size=0.0, w_spec=0.0, w_softf1=0.0)
-            print(" Teacher ready.")
-        except Exception as e:
-            print(f" Teacher build failed: {e} (continuing without KD)")
-
-    # --- student ---
-    model = safe_build_model(model_name, in_ch, ncls, **model_kwargs).to(device)
-
-    # --- optimizer ---
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-
-    # --- diagnostics (short) ---
-    try:
-        sample_x = next(iter(dl_tr))[0][:1].to(device)
-        diagnose_nan_issues(model, sample_x, device)
-        fix_nan_issues(model)
-    except Exception:
-        pass
-
-    # --- train loop ---
-    best_val_acc = 0.0
-    best_state = None
-    start = time.time()
-    for ep in range(cfg.epochs):
-        if teacher is not None:
-            tr_loss = kd_train_epoch(model, teacher, dl_tr, opt, device=device, meta=meta,
-                                     w_size=w_size, w_bit=w_bit, w_spec=w_spec, w_softf1=w_softf1)
-        else:
-            tr_loss = train_epoch_ce(model, dl_tr, opt, device=device, meta=meta,
-                                     w_size=w_size, w_spec=w_spec, w_softf1=w_softf1)
-
-        val_acc, val_loss = evaluate(model, dl_va, device=device)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        print(f'  Epoch {ep+1}/{cfg.epochs}: train_loss={tr_loss:.4f} val_acc={val_acc:.4f}')
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    dur = time.time() - start
-
-    # --- Calibration on val, test with same threshold (binary/single-label path) ---
-    # Assumes your `evaluate_logits`, `eval_prob_fn`, and `tune_threshold` are defined.
-    try:
-        v_logits, vy = evaluate_logits(model, dl_va, device=device)
-        vp = eval_prob_fn(v_logits)
-        vp_smooth = _medfilt(vp, k=5)
-        t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
-    except Exception:
-        t_star, val_f1 = 0.5, None
-
-    test_acc = None; test_f1 = None
-    if dl_te is not None:
-        test_acc, _ = evaluate(model, dl_te, device=device)
-        try:
-            te_logits, ty = evaluate_logits(model, dl_te, device=device)
-            tp = eval_prob_fn(te_logits)
-            tp_smooth = _medfilt(tp, k=5)
-            yhat = (tp_smooth >= t_star).astype(int)
-            test_f1 = f1_score(ty, yhat)
-        except Exception:
-            pass
-
-    # --- deployment profile ---
-    def _flash_bytes_int8(m):
-        try: return estimate_flash_usage(m, 'int8')["flash_bytes"]
-        except: return sum(p.numel() for p in m.parameters())
-    deploy = deployment_profile(model, meta, flash_bytes_fn=_flash_bytes_int8, device=str(device))
-
-    params = count_params(model)
-    print(f" Test accuracy: {test_acc if test_acc is not None else float('nan'):.4f}")
-    print(f" Best val acc: {best_val_acc:.4f} | Val F1@t*: {val_f1 if val_f1 is not None else float('nan'):.3f}")
-    print(f" Training time: {dur:.1f}s | Flash: {deploy['flash_kb']:.2f} KB")
-
-    return {
-        'dataset': dataset_name,
-        'model': _normalize_model_name(model_name),
-        'model_kwargs': model_kwargs,
-        'kd': kd,
-        'epochs': cfg.epochs,
-        'lr': cfg.lr,
-        'val_acc': best_val_acc,
-        'test_acc': test_acc,
-        'val_f1_at_t': val_f1,
-        'test_f1_at_t': test_f1,
-        'threshold_t': t_star,
-        'params': params,
-        'flash_kb': deploy['flash_kb'],
-        'ram_act_peak_kb': deploy['ram_act_peak_kb'],
-        'param_kb': deploy['param_kb'],
-        'buffer_kb': deploy['buffer_kb'],
-        'macs': deploy['macs'],
-        'latency_ms': deploy['latency_ms'],
-        'energy_mJ': deploy['energy_mJ'],
-        'train_time_s': dur,
-        'channels': meta.get('num_channels', None),
-        'seq_len': meta.get('seq_len', None),
-        'num_classes': meta.get('num_classes', None),
-    }
-
-# ---------- Size table (static) ----------
-def count_params(m):
-    return sum(p.numel() for p in m.parameters())
 
 def build_size_table_one_dataset(probe_dataset: str, cfg: ExpCfg):
     ret = make_dataset_for_experiment(
@@ -8390,79 +8432,6 @@ def train_epoch(model, loader, opt, device=None):
     return float(running_loss/n), correct/n
 
 
-def evaluate(model, loader, device=None):
-    """
-    Simple evaluation function that returns accuracy and loss.
-    Alternative to eval_logits when you just need metrics.
-    """
-    if device is None:
-        device = DEVICE
-
-    model.eval()
-    correct = 0
-    n = 0
-    running_loss = 0.0
-
-    for xb, yb in loader:
-        try:
-            xb = xb.to(device)
-            yb = yb.to(device)
-
-            logits = model(xb)
-            loss = F.cross_entropy(logits, yb)
-
-            if not (torch.isnan(loss) or torch.isinf(loss)):
-                running_loss += float(loss.item()) * xb.size(0)
-                preds = logits.argmax(1)
-                correct += int((preds==yb).sum().item())
-                n += xb.size(0)
-
-        except Exception as e:
-            print(f"Error in evaluation batch: {e}")
-            continue
-
-    if n == 0:
-        return 0.0, float('inf')
-
-    return correct/n, running_loss/n
-
-
-def evaluate(model, loader, device=None):
-    """
-    Simple evaluation function that returns accuracy and loss.
-    Alternative to eval_logits when you just need metrics.
-    """
-    if device is None:
-        device = DEVICE
-
-    model.eval()
-    correct = 0
-    n = 0
-    running_loss = 0.0
-
-    for xb, yb in loader:
-        try:
-            xb = xb.to(device)
-            yb = yb.to(device)
-
-            logits = model(xb)
-            loss = F.cross_entropy(logits, yb)
-
-            if not (torch.isnan(loss) or torch.isinf(loss)):
-                running_loss += float(loss.item()) * xb.size(0)
-                preds = logits.argmax(1)
-                correct += int((preds==yb).sum().item())
-                n += xb.size(0)
-
-        except Exception as e:
-            print(f"Error in evaluation batch: {e}")
-            continue
-
-    if n == 0:
-        return 0.0, float('inf')
-
-    return correct/n, running_loss/n
-
 
 def _unwrap_dataset(obj):
     d = getattr(obj, 'dataset', obj)
@@ -9625,164 +9594,6 @@ def print_class_dist_from_loaders(dl_tr, dl_va, dl_te, meta, max_samples=2000):
         for k in sorted(c): print(f"  class {k}: {c[k]} ({c[k]*100.0/total:.2f}%)")
         print("========================================")
 
-# ---------- Unified run_experiment (now supports model_kwargs + kd + weights) ----------
-
-def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=False,
-                           w_size=1.0, w_bit=0.05, w_spec=1e-4, w_softf1=0.10,
-                           loaders=None):
-    if loaders is None:
-        # fallback (but normally not used now)
-        ret = make_dataset_for_experiment(..., seed=getattr(cfg, "seed", 42))
-        dl_tr, dl_va, dl_te, meta = _normalize_dataset_return(ret)
-    else:
-        dl_tr, dl_va, dl_te, meta = loaders
-
-    print(f'\n{"="*60}\n Experiment: {dataset_name} + {model_name}\n{"="*60}')
-    model_kwargs = model_kwargs or {}
-
-    # --- loaders ---
-    try:
-        ret = make_dataset_for_experiment(
-            dataset_name,
-            limit=cfg.limit,
-            batch_size=cfg.batch_size,
-            target_fs=cfg.target_fs,
-            num_workers=cfg.num_workers,
-            length=cfg.length,
-            window_ms=cfg.window_ms,
-            input_len=cfg.input_len
-        )
-        #dl_tr, dl_va, dl_te, meta = _normalize_dataset_return(ret)
-        need_probe = ("num_channels" not in meta) or ("num_classes" not in meta) or ("seq_len" not in meta)
-        if need_probe:
-            xb, yb = next(iter(dl_tr))
-            meta.setdefault("num_channels", int(xb.shape[1]))
-            meta.setdefault("seq_len",     int(xb.shape[-1]))
-            if yb.ndim == 1:
-                meta.setdefault("num_classes", int(max(2, yb.max().item() + 1)))
-            elif yb.ndim == 2:
-                meta.setdefault("num_classes", int(yb.shape[1]))
-            else:
-                meta.setdefault("num_classes", 2)
-        print(f" Dataset meta: {meta}")
-        print(f" Train batches: {len(dl_tr)}, Val batches: {len(dl_va)}")
-    except Exception as e:
-        print(f'Failed to prepare dataset: {e}')
-        return None
-
-    device = torch.device(cfg.device)
-    in_ch  = meta['num_channels']
-    ncls   = meta['num_classes']
-
-    # --- teacher (optional) ---
-    teacher = None
-    if kd:
-        try:
-            teacher = safe_build_model("regular_cnn", in_ch, ncls).to(device)
-            t_opt = torch.optim.AdamW(teacher.parameters(), lr=cfg.lr)
-            t_epochs = max(3, (cfg.epochs // 2))
-            for _ in range(t_epochs):
-                _ = train_epoch_ce(teacher, dl_tr, t_opt, device=device, meta=meta,
-                                   w_size=0.0, w_spec=0.0, w_softf1=0.0)
-            print(" Teacher ready.")
-        except Exception as e:
-            print(f" Teacher build failed: {e} (continuing without KD)")
-
-    # --- student ---
-    model = safe_build_model(model_name, in_ch, ncls, **model_kwargs).to(device)
-
-    # --- optimizer ---
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-
-    # --- diagnostics (short) ---
-    try:
-        sample_x = next(iter(dl_tr))[0][:1].to(device)
-        diagnose_nan_issues(model, sample_x, device)
-        fix_nan_issues(model)
-    except Exception:
-        pass
-
-    # --- train loop ---
-    best_val_acc = 0.0
-    best_state = None
-    start = time.time()
-    for ep in range(cfg.epochs):
-        if teacher is not None:
-            tr_loss = kd_train_epoch(model, teacher, dl_tr, opt, device=device, meta=meta,
-                                     w_size=w_size, w_bit=w_bit, w_spec=w_spec, w_softf1=w_softf1)
-        else:
-            tr_loss = train_epoch_ce(model, dl_tr, opt, device=device, meta=meta,
-                                     w_size=w_size, w_spec=w_spec, w_softf1=w_softf1)
-
-        val_acc, val_loss = evaluate(model, dl_va, device=device)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        print(f'  Epoch {ep+1}/{cfg.epochs}: train_loss={tr_loss:.4f} val_acc={val_acc:.4f}')
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    dur = time.time() - start
-
-    # --- Calibration on val, test with same threshold (binary/single-label path) ---
-    # Assumes your `evaluate_logits`, `eval_prob_fn`, and `tune_threshold` are defined.
-    try:
-        v_logits, vy = evaluate_logits(model, dl_va, device=device)
-        vp = eval_prob_fn(v_logits)
-        vp_smooth = _medfilt(vp, k=5)
-        t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
-    except Exception:
-        t_star, val_f1 = 0.5, None
-
-    test_acc = None; test_f1 = None
-    if dl_te is not None:
-        test_acc, _ = evaluate(model, dl_te, device=device)
-        try:
-            te_logits, ty = evaluate_logits(model, dl_te, device=device)
-            tp = eval_prob_fn(te_logits)
-            yhat = (tp >= t_star).astype(int)
-            test_f1 = f1_score(ty, yhat)
-        except Exception:
-            pass
-
-    # --- deployment profile ---
-    def _flash_bytes_int8(m):
-        try: return estimate_flash_usage(m, 'int8')["flash_bytes"]
-        except: return sum(p.numel() for p in m.parameters())
-    deploy = deployment_profile(model, meta, flash_bytes_fn=_flash_bytes_int8, device=str(device))
-
-    params = count_params(model)
-    print(f" Test accuracy: {test_acc if test_acc is not None else float('nan'):.4f}")
-    print(f" Best val acc: {best_val_acc:.4f} | Val F1@t*: {val_f1 if val_f1 is not None else float('nan'):.3f}")
-    print(f" Training time: {dur:.1f}s | Flash: {deploy['flash_kb']:.2f} KB")
-
-    return {
-        'dataset': dataset_name,
-        'model': _normalize_model_name(model_name),
-        'model_kwargs': model_kwargs,
-        'kd': kd,
-        'epochs': cfg.epochs,
-        'lr': cfg.lr,
-        'val_acc': best_val_acc,
-        'test_acc': test_acc,
-        'val_f1_at_t': val_f1,
-        'test_f1_at_t': test_f1,
-        'threshold_t': t_star,
-        'params': params,
-        'flash_kb': deploy['flash_kb'],
-        'ram_act_peak_kb': deploy['ram_act_peak_kb'],
-        'param_kb': deploy['param_kb'],
-        'buffer_kb': deploy['buffer_kb'],
-        'macs': deploy['macs'],
-        'latency_ms': deploy['latency_ms'],
-        'energy_mJ': deploy['energy_mJ'],
-        'train_time_s': dur,
-        'channels': meta.get('num_channels', None),
-        'seq_len': meta.get('seq_len', None),
-        'num_classes': meta.get('num_classes', None),
-    }
-
-# ---------- Size table (static) ----------
 
 def count_params(m):
     return sum(p.numel() for p in m.parameters())
