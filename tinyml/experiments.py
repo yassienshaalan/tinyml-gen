@@ -3734,14 +3734,14 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
 
         # epoch-level EMA update (kept for TEST)
         ema.update()
-        valm = _val_at_tstar(model, dl_va, device, ema=None, k=5, grid=THRESH_GRID,use_ema=False, debug=(ep < 2))
+        valm = _val_at_tstar(model, dl_va, device, ema, k=5, grid=THRESH_GRID, use_ema=False, debug=False)
         if valm['f1'] > best['f1']:
             best.update(
-                f1=valm['f1'], t_star=valm['t_star'],
-                acc=valm['acc'], prec=valm['prec'], rec=valm['rec'],
-                state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-                epoch=ep+1
-            )
+            f1=valm['f1'], t_star=valm['t_star'],
+            acc=valm['acc'], prec=valm['prec'], rec=valm['rec'],
+            state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+            epoch=ep+1
+        )
 
         print(f'  Epoch {ep+1}/{cfg.epochs}: '
       f'train_loss={tr_loss:.4f} '
@@ -3751,57 +3751,74 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
       f'P/R(macro)={valm["prec"]:.3f}/{valm["rec"]:.3f}')
 
 
-    # restore best checkpoint + carry forward best VAL metrics
+    # --- restore best checkpoint + carry forward best VAL metrics ---
     if best['state'] is not None:
         model.load_state_dict(best['state'])
-    dur      = time.time() - start
-    t_star   = best['t_star']
-    t_star_raw  = best['t_star']  
-    val_f1   = best['f1']
-    val_acc  = best['acc']
-    val_prec = best['prec']
-    val_rec  = best['rec']
-    # Optional: derive an EMA-specific t* by tuning on VAL under EMA params
+
+    dur       = time.time() - start
+    t_star_raw = float(best['t_star'])   # threshold tuned on VAL (RAW branch during training)
+    val_f1     = float(best['f1'])
+    val_acc    = float(best['acc'])
+    val_prec   = float(best['prec'])
+    val_rec    = float(best['rec'])
+
+    # Derive an EMA-specific t* by tuning on VAL under EMA params (same smoothing/grid)
     with ema.average_parameters(model):
         v_logits_ema, vy_ema = eval_logits(model, dl_va, device=device)
-        vp_ema = eval_prob_fn(v_logits_ema)
-        vp_ema = _median_smooth_1d(vp_ema, k=5)
-        try:
-            t_star_ema, val_f1_ema = tune_threshold(vy_ema, vp_ema, THRESH_GRID)
-        except Exception:
-            t_star_ema, val_f1_ema = 0.5, float('nan')
-		
-    # --- TEST (EMA weights + same t*, median smoothing, grouped) ---
-    te_groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
-    metrics_raw, cm_raw = _test_at_tstar_raw(model, dl_te, device, t_star_raw, k=5, groups=te_groups)
-    print(f"[SUMMARY RAW] Test acc@t*={metrics_raw['acc']:.4f} | F1={metrics_raw['macro_f1']:.4f} | "f"balAcc={metrics_raw.get('balanced_acc', float('nan')):.4f} | AUC={metrics_raw.get('auc_raw', None)}")
+    vp_ema = eval_prob_fn(v_logits_ema)
+    vp_ema = _median_smooth_1d(vp_ema, k=5)
+    try:
+        t_star_ema, _ = tune_threshold(vy_ema, vp_ema, THRESH_GRID)
+        t_star_ema = float(t_star_ema)
+    except Exception:
+        t_star_ema = 0.5
 
-    # Compute TEST under EMA with its own t* from EMA VAL
-    with ema.average_parameters(model):
-        te_logits, ty = eval_logits(model, dl_te, device=device)
-        tp_raw = eval_prob_fn(te_logits)
-        tp = _median_smooth_1d(tp_raw, k=5)
-        yhat = (tp >= t_star_ema).astype(int)
-        metrics_ema = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=te_groups)
-        cm_ema = confusion_matrix(ty, yhat).tolist()
-        print(f"[TEST EMA] pos_rate@t*: {float(yhat.mean()):.3f}")
-        print(f"[SUMMARY EMA] Test acc@t*={metrics_ema['acc']:.4f} | F1={metrics_ema['macro_f1']:.4f} | "f"balAcc={metrics_ema.get('balanced_acc', float('nan')):.4f} | AUC={metrics_ema.get('auc_raw', None)}")
+    print(f"[EVAL] TEST: t*_raw={t_star_raw:.4f} | t*_ema={t_star_ema:.4f}")
 
-    # Pick the better one to report/save
+    # --- TEST both branches at their *own* t*, then choose the better macro-F1 ---
+    # Helper calls (use your unified helper; it computes groups internally)
+    metrics_raw, cm_raw = _test_at_tstar(
+        model, dl_te, device, t_star=t_star_raw, k=5, ema_ctx=None, stage="RAW"
+    )
+    metrics_ema, cm_ema = _test_at_tstar(
+        model, dl_te, device, t_star=t_star_ema, k=5, ema_ctx=ema.average_parameters(model), stage="EMA"
+    )
+
+    # Print branch summaries
+    print(
+        f"[SUMMARY RAW] Test acc@t*={metrics_raw['acc']:.4f} "
+        f"| F1={metrics_raw['macro_f1']:.4f} "
+        f"| balAcc={metrics_raw.get('balanced_acc', float('nan')):.4f} "
+        f"| AUC={metrics_raw.get('auc_raw', None)}"
+    )
+    print(
+        f"[SUMMARY EMA] Test acc@t*={metrics_ema['acc']:.4f} "
+        f"| F1={metrics_ema['macro_f1']:.4f} "
+        f"| balAcc={metrics_ema.get('balanced_acc', float('nan')):.4f} "
+        f"| AUC={metrics_ema.get('auc_raw', None)}"
+    )
+
+    # Pick the better branch by macro-F1
     use_ema = (metrics_ema['macro_f1'] > metrics_raw['macro_f1'])
     metrics, cm = (metrics_ema, cm_ema) if use_ema else (metrics_raw, cm_raw)
-    t_star = float(t_star_ema if use_ema else t_star_raw)
+    t_star      = float(t_star_ema if use_ema else t_star_raw)
+    chosen      = "EMA" if use_ema else "RAW"
 
-    print(f" New Test acc@t*={metrics['acc']:.4f} "f"| macroF1@t*={metrics['macro_f1']:.4f} "
-    f"| P/R(macro)@t*={metrics['precision_macro']:.4f}/{metrics['recall_macro']:.4f} "
-    f"| balAcc@t*={(metrics.get('balanced_acc', float('nan'))):.4f} "
-    f"| AUC(raw)={metrics.get('auc_raw', None)} "
-    f"| chosen={'EMA' if use_ema else 'RAW'}"
+    print(
+        f" New Test acc@t*={metrics['acc']:.4f} "
+        f"| macroF1@t*={metrics['macro_f1']:.4f} "
+        f"| P/R(macro)@t*={metrics['precision_macro']:.4f}/{metrics['recall_macro']:.4f} "
+        f"| balAcc@t*={(metrics.get('balanced_acc', float('nan'))):.4f} "
+        f"| AUC(raw)={metrics.get('auc_raw', None)} "
+        f"| chosen={chosen}"
     )
+
     # --- deployment profile ---
     def _flash_bytes_int8(m):
-        try: return estimate_flash_usage(m, 'int8')["flash_bytes"]
-        except: return sum(p.numel() for p in m.parameters())
+        try:
+            return estimate_flash_usage(m, 'int8')["flash_bytes"]
+        except Exception:
+            return sum(p.numel() for p in m.parameters())
     deploy = deployment_profile(model, meta, flash_bytes_fn=_flash_bytes_int8, device=str(device))
 
     params = count_params(model)
@@ -3848,53 +3865,65 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         'num_classes': meta.get('num_classes', None),
     }
 
-def _val_at_tstar(model, dl, device, ema, k=5, grid=None, use_ema=True, debug=False):
-    import numpy as np
-    grid = (np.linspace(0.05, 0.95, 181) if (grid is None) else grid)
+def _val_at_tstar(model, loader, device, ema, k=5, grid=None, use_ema=False, debug=False):
+    """
+    Get VAL metrics at the best t* for this branch (RAW or EMA).
+    Returns dict(f1, acc, prec, rec, t_star).
+    """
+    grid = np.asarray(grid) if grid is not None else np.linspace(0.05, 0.95, 181)
 
-    ctx = (ema.average_parameters(model) if (use_ema and ema is not None) else contextlib.nullcontext())
-    with ctx:
-        v_logits, vy = eval_logits(model, dl, device=device)
-        vp_raw = eval_prob_fn(v_logits)
-        vp = _median_smooth_1d(vp_raw, k=k) if k and k > 1 else vp_raw
+    if use_ema:
+        with ema.average_parameters(model):
+            v_logits, vy = eval_logits(model, loader, device=device)
+    else:
+        v_logits, vy = eval_logits(model, loader, device=device)
+
+    p_raw = eval_prob_fn(v_logits)
+    p_smooth = _median_smooth_1d(p_raw, k=k)
+
+    # tune t* on *this* branch
+    t_star, f1 = tune_threshold(vy, p_smooth, grid)
+
+    # compute thresholded metrics at t*
+    yhat = (p_smooth >= t_star).astype(int)
+    avg  = _choose_avg(vy)
+    acc  = accuracy_score(vy, yhat)
+    prec = precision_score(vy, yhat, average=avg, zero_division=0)
+    rec  = recall_score(vy, yhat, average=avg, zero_division=0)
 
     if debug:
-        print(f"[VAL DEBUG] grid_len={len(grid)}  grid_min/max={grid[0]:.3f}/{grid[-1]:.3f}")
-        print(f"[VAL DEBUG] p_raw min/mean/max: {vp_raw.min():.3f}/{vp_raw.mean():.3f}/{vp_raw.max():.3f}")
-        print(f"[VAL DEBUG] p_smooth min/mean/max: {vp.min():.3f}/{vp.mean():.3f}/{vp.max():.3f}")
+        print(f"[VAL DEBUG] grid_len={len(grid)}  grid_min/max={grid.min():.3f}/{grid.max():.3f}")
+        print(f"[VAL DEBUG] p_raw min/mean/max: {p_raw.min():.3f}/{p_raw.mean():.3f}/{p_raw.max():.3f}")
+        print(f"[VAL DEBUG] p_smooth min/mean/max: {p_smooth.min():.3f}/{p_smooth.mean():.3f}/{p_smooth.max():.3f}")
+        pos_rate = yhat.mean() if yhat.size else float('nan')
+        print(f"[VAL DEBUG] t*={t_star:.3f} | F1={f1:.3f} | acc={acc:.3f} | pos_rate={pos_rate:.3f}")
 
-    best_f1, best_t = -1.0, 0.5
-    for t in grid:
-        pred = (vp >= t).astype(int)
-        f1 = f1_score(vy, pred, average=_choose_avg(vy), zero_division=0)
-        if f1 > best_f1:
-            best_f1, best_t = f1, float(t)
+    return dict(f1=float(f1), acc=float(acc), prec=float(prec), rec=float(rec), t_star=float(t_star))
 
-    pred_best = (vp >= best_t).astype(int)
-    acc  = accuracy_score(vy, pred_best)
-    prec = precision_score(vy, pred_best, average=_choose_avg(vy), zero_division=0)
-    rec  = recall_score(vy, pred_best, average=_choose_avg(vy), zero_division=0)
-    if debug:
-        pos_rate = pred_best.mean()
-        print(f"[VAL DEBUG] t*={best_t:.3f} | F1={best_f1:.3f} | acc={acc:.3f} | pos_rate={pos_rate:.3f}")
 
-    return {'f1': best_f1, 't_star': best_t, 'acc': acc, 'prec': prec, 'rec': rec}
-	
-def _test_at_tstar(model, loader, device, ema, t_star, k=5, groups=None):
+def _test_at_tstar(model, loader, device, t_star, k=5, ema_ctx=None, stage="RAW"):
     """
-    Test under EMA-averaged weights with per-record median smoothing and given t*.
+    Evaluate TEST at a fixed t* with optional EMA context.
+    Returns (metrics_dict, confusion_matrix_list).
     """
-    with ema.average_parameters(model):
+    if ema_ctx is None:
         te_logits, ty = eval_logits(model, loader, device=device)
-        tp_raw = eval_prob_fn(te_logits)
-    tp   = _median_smooth_grouped(tp_raw, groups=groups, k=k)
-    yhat = (tp >= t_star).astype(int)
-    metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
-    cm = confusion_matrix(ty, yhat).tolist()
-    # quick sanity for “constant predictions” symptom
-    print(f"[TEST] positive rate@t*: {yhat.mean():.3f}")
-    return metrics, cm
+    else:
+        with ema_ctx:
+            te_logits, ty = eval_logits(model, loader, device=device)
 
+    tp_raw = eval_prob_fn(te_logits)
+    tp = _median_smooth_1d(tp_raw, k=k)
+    yhat = (tp >= t_star).astype(int)
+
+    groups  = getattr(getattr(loader, 'dataset', None), 'record_ids', None)
+    metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
+    cm      = confusion_matrix(ty, yhat).tolist()
+
+    pos_rate = float(yhat.mean()) if yhat.size else float('nan')
+    print(f"[TEST {stage}] pos_rate@t*: {pos_rate:.3f}")
+    return metrics, cm
+	
 def _median_smooth_grouped(p, groups=None, k=5):
     """
     Apply 1D median smoothing per record id (group). If groups is None,
@@ -9899,7 +9928,7 @@ def _maybe_teacher_outputs(teacher, xb):
     return teacher(xb)
 
 def _best_threshold_macro_f1(y_true, p1, grid=None):
-    grid = grid or np.linspace(0.05, 0.95, 19)
+    grid = np.asarray(grid) if grid is not None else np.linspace(0.05, 0.95, 181)
     best_t, best_f1 = 0.5, 0.0
     for t in grid:
         yhat = (p1 >= t).astype(int)
