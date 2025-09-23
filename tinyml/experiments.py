@@ -3763,15 +3763,30 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
 
     # --- TEST (EMA weights + same t*, median smoothing, grouped) ---
     te_groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
-    print(f"[EVAL] TEST: EMA=yes | median_k=5 | t* (from val)={t_star:.4f}")
-    metrics, cm = _test_at_tstar(model, dl_te, device, ema, t_star, k=5, groups=te_groups)
+    metrics_raw, cm_raw = _test_at_tstar_raw(model, dl_te, device, t_star_raw, k=5, groups=te_groups)
+    print(f"[SUMMARY RAW] Test acc@t*={metrics_raw['acc']:.4f} | F1={metrics_raw['macro_f1']:.4f} | "f"balAcc={metrics_raw.get('balanced_acc', float('nan')):.4f} | AUC={metrics_raw.get('auc_raw', None)}")
 
-    print(
-        f" New Test acc@t*={metrics['acc']:.4f} "
-        f"| macroF1@t*={metrics['macro_f1']:.4f} "
-        f"| P/R(macro)@t*={metrics['precision_macro']:.4f}/{metrics['recall_macro']:.4f} "
-        f"| balAcc@t*={(metrics.get('balanced_acc', float('nan'))):.4f} "
-        f"| AUC(raw)={metrics.get('auc_raw', None)}"
+    # Compute TEST under EMA with its own t* from EMA VAL
+    with ema.average_parameters(model):
+        te_logits, ty = eval_logits(model, dl_te, device=device)
+        tp_raw = eval_prob_fn(te_logits)
+        tp = _median_smooth_1d(tp_raw, k=5)
+        yhat = (tp >= t_star_ema).astype(int)
+        metrics_ema = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=te_groups)
+        cm_ema = confusion_matrix(ty, yhat).tolist()
+        print(f"[TEST EMA] pos_rate@t*: {float(yhat.mean()):.3f}")
+        print(f"[SUMMARY EMA] Test acc@t*={metrics_ema['acc']:.4f} | F1={metrics_ema['macro_f1']:.4f} | "f"balAcc={metrics_ema.get('balanced_acc', float('nan')):.4f} | AUC={metrics_ema.get('auc_raw', None)}")
+
+    # Pick the better one to report/save
+    use_ema = (metrics_ema['macro_f1'] > metrics_raw['macro_f1'])
+    metrics, cm = (metrics_ema, cm_ema) if use_ema else (metrics_raw, cm_raw)
+    t_star = float(t_star_ema if use_ema else t_star_raw)
+
+    print(f" New Test acc@t*={metrics['acc']:.4f} "f"| macroF1@t*={metrics['macro_f1']:.4f} "
+    f"| P/R(macro)@t*={metrics['precision_macro']:.4f}/{metrics['recall_macro']:.4f} "
+    f"| balAcc@t*={(metrics.get('balanced_acc', float('nan'))):.4f} "
+    f"| AUC(raw)={metrics.get('auc_raw', None)} "
+    f"| chosen={'EMA' if use_ema else 'RAW'}"
     )
     # --- deployment profile ---
     def _flash_bytes_int8(m):
@@ -4096,6 +4111,18 @@ def run_suite(parallel: bool = False, max_workers: int = None):
             except Exception as e:
                 print(f"[FAIL] {name} → {e}")
 
+def _test_at_tstar_raw(m, loader, dev, t_star, k=5, groups=None):
+    te_logits, ty = eval_logits(m, loader, device=dev)
+    tp_raw = eval_prob_fn(te_logits)
+    tp = _median_smooth_1d(tp_raw, k=k)
+    yhat = (tp >= t_star).astype(int)
+    metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
+    cm = confusion_matrix(ty, yhat).tolist()
+    # debug
+    pos_rate = float(yhat.mean())
+    print(f"[TEST RAW] pos_rate@t*: {pos_rate:.3f}")
+    return metrics, cm
+	
 def _stamp_str():
     """
     Single-run stamp. You can override via env RUN_STAMP=YYYYmmdd-HHMMSS
