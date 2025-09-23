@@ -3624,8 +3624,11 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
                            loaders=None):
     """
     Unified training + threshold-tuned evaluation (EMA + median smoothing).
-    No legacy 'Test accuracy:' print.
+    No legacy 'Test accuracy:' print. Checkpoints by best VAL macro-F1@t*.
     """
+    import time
+    import numpy as np
+
     model_kwargs = model_kwargs or {}
 
     # --- loaders / meta ---
@@ -3701,18 +3704,18 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
     except Exception:
         pass
 
-    # Helper: fast val acc without printing
-    def _quick_val_acc(m, loader, dev):
-        v_logits, vy = eval_logits(m, loader, device=dev)  # returns np arrays
-        if v_logits.ndim > 1:
-            v_pred = v_logits.argmax(axis=1)
-        else:
-            v_pred = (v_logits >= 0.5).astype(int)
-        return float(accuracy_score(vy, v_pred))
+    # decide threshold grid safely (avoid 'array or default' bug)
+    try:
+        grid = THRESH_GRID
+    except NameError:
+        grid = None
+    if grid is None:
+        grid = np.linspace(0.05, 0.95, 181)
 
-    # --- train loop (select checkpoint by F1@t* with EMA + smoothing) ---
+    # --- train loop (checkpoint by best VAL macro-F1@t* with EMA + smoothing) ---
     best = dict(f1=-1.0, t_star=0.5, state=None, epoch=-1, acc=0.0, prec=0.0, rec=0.0)
     start = time.time()
+
     for ep in range(cfg.epochs):
         if teacher is not None:
             tr_loss = kd_train_epoch(
@@ -3729,32 +3732,52 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         # epoch-level EMA update
         ema.update()
 
-        # evaluate VAL at t* (EMA + smoothing) and checkpoint by F1
-        valm = _val_at_tstar(model, dl_va, device, ema, k=5, grid=THRESH_GRID)
-        if valm['f1'] > best['f1']:
+        # VAL: tune t* on EMA parameters, with median smoothing (k=5)
+        with ema.average_parameters(model):
+            v_logits, vy = eval_logits(model, dl_va, device=device)
+        vp = eval_prob_fn(v_logits)
+        vp_smooth = _median_smooth_1d(vp, k=5)
+        try:
+            t_star_cur, val_f1_cur = tune_threshold(vy, vp_smooth, grid)
+        except Exception:
+            t_star_cur, val_f1_cur = 0.5, float('nan')
+
+        # compute VAL stats at this t* (unsmoothed for classification decision, as in prior code)
+        yhat_va = (vp >= t_star_cur).astype(int)
+        val_acc_cur  = float(accuracy_score(vy, yhat_va))
+        avg_va       = _choose_avg(vy)
+        val_prec_cur = float(precision_score(vy, yhat_va, average=avg_va, zero_division=0))
+        val_rec_cur  = float(recall_score(vy, yhat_va,    average=avg_va, zero_division=0))
+
+        # checkpoint by best F1
+        if (not np.isnan(val_f1_cur)) and (val_f1_cur > best['f1']):
             best.update(
-                f1=valm['f1'], t_star=valm['t_star'],
-                acc=valm['acc'], prec=valm['prec'], rec=valm['rec'],
+                f1=float(val_f1_cur),
+                t_star=float(t_star_cur),
+                acc=val_acc_cur,
+                prec=val_prec_cur,
+                rec=val_rec_cur,
                 state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-                epoch=ep+1
+                epoch=ep + 1
             )
 
         print(f'  Epoch {ep+1}/{cfg.epochs}: '
-            f'train_loss={tr_loss:.4f} '
-            f'val_acc@t*={valm["acc"]:.4f} '
-            f'val_F1@t*={valm["f1"]:.4f} '
-            f't*={valm["t_star"]:.3f} '
-            f'P/R={valm["prec"]:.3f}/{valm["rec"]:.3f}')
+              f'train_loss={tr_loss:.4f} '
+              f'val_acc@t*={val_acc_cur:.4f} '
+              f'val_F1@t*={val_f1_cur:.4f} '
+              f't*={t_star_cur:.3f} '
+              f'P/R={val_prec_cur:.3f}/{val_rec_cur:.3f}')
 
     # restore best checkpoint + carry forward best VAL metrics
     if best['state'] is not None:
         model.load_state_dict(best['state'])
-    dur     = time.time() - start
-    t_star  = best['t_star']
-    val_f1  = best['f1']
-    val_acc = best['acc']   # if you log this later
+    dur      = time.time() - start
+    t_star   = best['t_star']
+    val_f1   = best['f1']
+    val_acc  = best['acc']
     val_prec = best['prec']
     val_rec  = best['rec']
+
     # --- TEST (EMA weights + same t*, median smoothing) ---
     print(f"[EVAL] TEST: EMA=yes | median_k=5 | t* (from val)={t_star:.4f}")
     with ema.average_parameters(model):
@@ -3781,7 +3804,7 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
     deploy = deployment_profile(model, meta, flash_bytes_fn=_flash_bytes_int8, device=str(device))
 
     params = count_params(model)
-    print(f" Best val acc: {best_val_acc:.4f} | Val F1@t*: {val_f1 if not np.isnan(val_f1) else float('nan'):.3f}")
+    print(f" Best val acc@t*: {val_acc:.4f} | Val F1@t*: {val_f1 if not np.isnan(val_f1) else float('nan'):.3f}")
     print(f" Training time: {dur:.1f}s | Flash: {deploy['flash_kb']:.2f} KB")
 
     return {
@@ -3792,10 +3815,13 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         'epochs': cfg.epochs,
         'lr': cfg.lr,
 
-        'val_acc': float(best_val_acc),
+        # best VAL snapshot numbers (at its t*)
+        'val_acc': float(val_acc),
         'val_f1_at_t': float(val_f1),
+        'val_precision_at_t': float(val_prec),
+        'val_recall_at_t': float(val_rec),
 
-        # new test metrics
+        # TEST metrics (EMA + same t*, thresholded; includes CIs where computed)
         'test_acc': float(metrics['acc']),
         'test_f1_at_t': float(metrics['macro_f1']),
         'test_precision_at_t': float(metrics['precision_macro']),
@@ -3823,20 +3849,28 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         'num_classes': meta.get('num_classes', None),
     }
 
-def _val_at_tstar(model, dl_va, device, ema=None, k=5, grid=None):
-    grid = grid or np.linspace(0.05, 0.95, 181)  # finer & wider than 0.5-only
-    ctx = ema.average_parameters(model) if ema is not None else contextlib.ExitStack()
-    with ctx:
-        v_logits, vy = evaluate_logits(model, dl_va, device=device)
-        vp = eval_prob_fn(v_logits)                    # probs for positive class
-        vp_smooth = _median_smooth_1d(vp, k=k)
-        t_star, val_f1 = tune_threshold(vy, vp_smooth, grid)
-        yhat = (vp_smooth >= t_star).astype(int)
-        val_acc = accuracy_score(vy, yhat)
-        val_prec = precision_score(vy, yhat, average=_choose_avg(vy), zero_division=0)
-        val_rec  = recall_score(vy,  yhat, average=_choose_avg(vy), zero_division=0)
-    return dict(t_star=float(t_star), f1=float(val_f1),
-                acc=float(val_acc), prec=float(val_prec), rec=float(val_rec))
+def _val_at_tstar(model, loader, device, ema, k: int = 5, grid=None):
+    # grid default without using `or` on arrays
+    if grid is None:
+        grid = np.linspace(0.05, 0.95, 181)  # [0.05..0.95] step≈0.005
+    with ema.average_parameters(model):
+        v_logits, vy = eval_logits(model, loader, device=device)
+    vp = eval_prob_fn(v_logits)
+    vp_smooth = _median_smooth_1d(vp, k=k) if (k is not None and k > 1) else vp
+    t_star, val_f1 = tune_threshold(vy, vp_smooth, grid)
+    val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
+    return {"t_star": float(t_star), "f1": float(val_f1), "acc": float(val_acc),
+            "vy": vy, "vp": vp, "vp_smooth": vp_smooth}
+
+def _test_at_tstar(model, loader, device, ema, t_star: float, k: int = 5, groups=None):
+    with ema.average_parameters(model):
+        te_logits, ty = eval_logits(model, loader, device=device)
+        tp_raw = eval_prob_fn(te_logits)
+    tp = _median_smooth_1d(tp_raw, k=k) if (k is not None and k > 1) else tp_raw
+    yhat = (tp >= t_star).astype(int)
+    metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
+    cm = confusion_matrix(ty, yhat).tolist()
+    return {"metrics": metrics, "cm": cm, "ty": ty, "tp_raw": tp_raw, "tp": tp, "yhat": yhat}
 
 def run_one(spec):
     """
