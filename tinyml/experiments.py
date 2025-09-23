@@ -3712,6 +3712,9 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
     if grid is None:
         grid = np.linspace(0.05, 0.95, 181)
 
+    va_groups = getattr(getattr(dl_va, 'dataset', None), 'record_ids', None)
+    te_groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
+
     # --- train loop (checkpoint by best VAL macro-F1@t* with EMA + smoothing) ---
     best = dict(f1=-1.0, t_star=0.5, state=None, epoch=-1, acc=0.0, prec=0.0, rec=0.0)
     start = time.time()
@@ -3733,7 +3736,7 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         ema.update()
 
         # VAL at t* using **current** weights (not EMA) and **smoothed** probs
-        valm = _val_at_tstar(model, dl_va, device, ema=None, grid=THRESH_GRID, k=5, use_ema=False)
+        valm = _val_at_tstar(model, dl_va, device, ema, grid=THRESH_GRID, k=5, use_ema=True, groups=va_groups)
         if valm['f1'] > best['f1']:
             best.update(
                 f1=valm['f1'], t_star=valm['t_star'],
@@ -3749,6 +3752,7 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
             f't*={valm["t_star"]:.3f} '
             f'P/R(macro)={valm["prec"]:.3f}/{valm["rec"]:.3f}')
 
+
     # restore best checkpoint + carry forward best VAL metrics
     if best['state'] is not None:
         model.load_state_dict(best['state'])
@@ -3759,19 +3763,11 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
     val_prec = best['prec']
     val_rec  = best['rec']
 
-    # --- TEST (EMA weights + same t*, median smoothing) ---
-    #print(f"[EVAL] TEST: EMA=yes | median_k=5 | t* (from val)={t_star:.4f}")
-    with ema.average_parameters(model):
-        te_logits, ty = eval_logits(model, dl_te, device=device)
-        tp_raw = eval_prob_fn(te_logits)
-        tp = _median_smooth_1d(tp_raw, k=5)
-        yhat = (tp >= t_star).astype(int)
-        groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
-        metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
-        cm = confusion_matrix(ty, yhat).tolist()
-
+    # --- TEST (EMA weights + same t*, median smoothing, grouped) ---
+    te_groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
     print(f"[EVAL] TEST: EMA=yes | median_k=5 | t* (from val)={t_star:.4f}")
-    metrics, cm = _test_at_tstar(model, dl_te, device, ema, t_star, k=5)
+    metrics, cm = _test_at_tstar(model, dl_te, device, ema, t_star, k=5, groups=te_groups)
+
     print(
         f" New Test acc@t*={metrics['acc']:.4f} "
         f"| macroF1@t*={metrics['macro_f1']:.4f} "
@@ -3779,7 +3775,6 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         f"| balAcc@t*={(metrics.get('balanced_acc', float('nan'))):.4f} "
         f"| AUC(raw)={metrics.get('auc_raw', None)}"
     )
-
     # --- deployment profile ---
     def _flash_bytes_int8(m):
         try: return estimate_flash_usage(m, 'int8')["flash_bytes"]
@@ -3830,52 +3825,64 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         'num_classes': meta.get('num_classes', None),
     }
 
-def _val_at_tstar(model, loader, device, ema=None, grid=None, k=5, use_ema=False):
+def _val_at_tstar(model, loader, device, ema=None, grid=None, k=5, use_ema=False, groups=None):
     """
     Compute t* on VAL via F1 over a threshold grid using median-smoothed probs.
-    Returns metrics computed with the SAME smoothed decisions at t*.
+    Metrics are computed from the SAME smoothed decisions at t*.
     """
+    import numpy as np
     if grid is None:
         grid = np.linspace(0.05, 0.95, 181)
 
-    # logits under either current weights or EMA-averaged weights
     if use_ema and (ema is not None):
         with ema.average_parameters(model):
             v_logits, vy = eval_logits(model, loader, device=device)
     else:
         v_logits, vy = eval_logits(model, loader, device=device)
 
-    vp = eval_prob_fn(v_logits)
-    vp_smooth = _median_smooth_1d(vp, k=k)
+    vp = eval_prob_fn(v_logits)              # must be P(class=1) as a 1D array
+    vp_s = _median_smooth_grouped(vp, groups=groups, k=k)
 
-    # tune t* on the smoothed probabilities
-    t_star, f1 = tune_threshold(vy, vp_smooth, grid)
+    t_star, f1 = tune_threshold(vy, vp_s, grid)
+    yhat = (vp_s >= t_star).astype(int)
 
-    # compute decisions **also from smoothed probs** at t*
-    yhat = (vp_smooth >= t_star).astype(int)
-
-    # macro precision/recall as printed
     acc  = float(accuracy_score(vy, yhat))
     prec = float(precision_score(vy, yhat, average='macro', zero_division=0))
     rec  = float(recall_score(vy, yhat, average='macro', zero_division=0))
-
     return {'t_star': float(t_star), 'f1': float(f1), 'acc': acc, 'prec': prec, 'rec': rec}
 
-
-def _test_at_tstar(model, loader, device, ema, t_star, k=5):
+def _test_at_tstar(model, loader, device, ema, t_star, k=5, groups=None):
     """
-    Test under EMA-averaged weights with median smoothing and the given t*.
-    Returns (metrics_dict, confusion_matrix_list).
+    Test under EMA-averaged weights with per-record median smoothing and given t*.
     """
     with ema.average_parameters(model):
         te_logits, ty = eval_logits(model, loader, device=device)
         tp_raw = eval_prob_fn(te_logits)
-    tp   = _median_smooth_1d(tp_raw, k=k)
+    tp   = _median_smooth_grouped(tp_raw, groups=groups, k=k)
     yhat = (tp >= t_star).astype(int)
-    groups  = getattr(getattr(loader, 'dataset', None), 'record_ids', None)
     metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
-    cm      = confusion_matrix(ty, yhat).tolist()
+    cm = confusion_matrix(ty, yhat).tolist()
+    # quick sanity for “constant predictions” symptom
+    print(f"[TEST] positive rate@t*: {yhat.mean():.3f}")
     return metrics, cm
+
+def _median_smooth_grouped(p, groups=None, k=5):
+    """
+    Apply 1D median smoothing per record id (group). If groups is None,
+    fall back to global smoothing.
+    """
+    import numpy as np
+    p = np.asarray(p)
+    if groups is None:
+        return _median_smooth_1d(p, k=k)
+
+    groups = np.asarray(groups)
+    out = np.empty_like(p)
+    # preserve within-record locality
+    for gid in np.unique(groups):
+        idx = np.where(groups == gid)[0]
+        out[idx] = _median_smooth_1d(p[idx], k=k)
+    return out
 
 def run_one(spec):
     """
