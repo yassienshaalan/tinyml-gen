@@ -3393,9 +3393,14 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
         if val_f1 > best[0]:
             best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
 
-        val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
+        yhat_val = (vp_smooth >= t_star).astype(int)  # <-- use smoothed probs here
+        val_acc  = accuracy_score(vy, yhat_val)
+        val_prec = precision_score(vy, yhat_val, average=_choose_avg(vy), zero_division=0)
+        val_rec  = recall_score(vy,  yhat_val, average=_choose_avg(vy), zero_division=0)
+
         print(f'  Epoch {ep+1}/{cfg.epochs}: train_loss={train_loss:.4f} '
-              f'train_acc={train_acc:.4f} val_acc@t*={val_acc:.4f} val_f1@t*={val_f1:.4f} t*={t_star:.2f}')
+            f'train_acc={train_acc:.4f} val_acc@t*={val_acc:.4f} '
+            f'val_f1@t*={val_f1:.4f} t*={t_star:.2f} P/R={val_prec:.3f}/{val_rec:.3f}')
 
     dur = time.time() - start
 
@@ -3705,9 +3710,8 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
             v_pred = (v_logits >= 0.5).astype(int)
         return float(accuracy_score(vy, v_pred))
 
-    # --- train loop ---
-    best_val_acc = 0.0
-    best_state = None
+    # --- train loop (select checkpoint by F1@t* with EMA + smoothing) ---
+    best = dict(f1=-1.0, t_star=0.5, state=None, epoch=-1, acc=0.0, prec=0.0, rec=0.0)
     start = time.time()
     for ep in range(cfg.epochs):
         if teacher is not None:
@@ -3722,32 +3726,35 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
                 w_size=w_size, w_spec=w_spec, w_softf1=w_softf1
             )
 
-        # epoch-level EMA update (simple but effective)
+        # epoch-level EMA update
         ema.update()
 
-        # silent val-acc (no legacy prints)
-        val_acc = _quick_val_acc(model, dl_va, device)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        # evaluate VAL at t* (EMA + smoothing) and checkpoint by F1
+        valm = _val_at_tstar(model, dl_va, device, ema, k=5, grid=THRESH_GRID)
+        if valm['f1'] > best['f1']:
+            best.update(
+                f1=valm['f1'], t_star=valm['t_star'],
+                acc=valm['acc'], prec=valm['prec'], rec=valm['rec'],
+                state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                epoch=ep+1
+            )
 
-        print(f'  Epoch {ep+1}/{cfg.epochs}: train_loss={tr_loss:.4f} val_acc={val_acc:.4f}')
+        print(f'  Epoch {ep+1}/{cfg.epochs}: '
+            f'train_loss={tr_loss:.4f} '
+            f'val_acc@t*={valm["acc"]:.4f} '
+            f'val_F1@t*={valm["f1"]:.4f} '
+            f't*={valm["t_star"]:.3f} '
+            f'P/R={valm["prec"]:.3f}/{valm["rec"]:.3f}')
 
-    # restore best-val weights
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    dur = time.time() - start
-
-    # --- Threshold tuning on VAL (EMA weights) ---
-    with ema.average_parameters(model):
-        v_logits, vy = eval_logits(model, dl_va, device=device)
-        vp = eval_prob_fn(v_logits)
-        vp_smooth = _median_smooth_1d(vp, k=5)
-        try:
-            t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
-        except Exception:
-            t_star, val_f1 = 0.5, float('nan')
-
+    # restore best checkpoint + carry forward best VAL metrics
+    if best['state'] is not None:
+        model.load_state_dict(best['state'])
+    dur     = time.time() - start
+    t_star  = best['t_star']
+    val_f1  = best['f1']
+    val_acc = best['acc']   # if you log this later
+    val_prec = best['prec']
+    val_rec  = best['rec']
     # --- TEST (EMA weights + same t*, median smoothing) ---
     print(f"[EVAL] TEST: EMA=yes | median_k=5 | t* (from val)={t_star:.4f}")
     with ema.average_parameters(model):
@@ -3816,6 +3823,20 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         'num_classes': meta.get('num_classes', None),
     }
 
+def _val_at_tstar(model, dl_va, device, ema=None, k=5, grid=None):
+    grid = grid or np.linspace(0.05, 0.95, 181)  # finer & wider than 0.5-only
+    ctx = ema.average_parameters(model) if ema is not None else contextlib.ExitStack()
+    with ctx:
+        v_logits, vy = evaluate_logits(model, dl_va, device=device)
+        vp = eval_prob_fn(v_logits)                    # probs for positive class
+        vp_smooth = _median_smooth_1d(vp, k=k)
+        t_star, val_f1 = tune_threshold(vy, vp_smooth, grid)
+        yhat = (vp_smooth >= t_star).astype(int)
+        val_acc = accuracy_score(vy, yhat)
+        val_prec = precision_score(vy, yhat, average=_choose_avg(vy), zero_division=0)
+        val_rec  = recall_score(vy,  yhat, average=_choose_avg(vy), zero_division=0)
+    return dict(t_star=float(t_star), f1=float(val_f1),
+                acc=float(val_acc), prec=float(val_prec), rec=float(val_rec))
 
 def run_one(spec):
     """
