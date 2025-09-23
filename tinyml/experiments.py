@@ -3734,9 +3734,9 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
 
         # epoch-level EMA update (kept for TEST)
         ema.update()
-        use_ema_now = (ep >= 2)
+        use_ema_now = (ep + 1) >= max(2, int(0.25 * cfg.epochs))  # no-EMA for first ~25% epochs
         # VAL at t* using **current** weights (not EMA) and **smoothed** probs
-        valm = _val_at_tstar(model, dl_va, device, ema, k=5, grid=None, use_ema=use_ema_now, debug=(ep < 2))
+        valm = _val_at_tstar(model, dl_va, device, ema, k=5, grid=THRESH_GRID,use_ema=use_ema_now, debug=(ep < 2))
         if valm['f1'] > best['f1']:
             best.update(
                 f1=valm['f1'], t_star=valm['t_star'],
@@ -3825,51 +3825,38 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         'num_classes': meta.get('num_classes', None),
     }
 
-def _val_at_tstar(model, loader, device, ema, k=5, grid=None, use_ema=True, debug=False):
-    import contextlib, numpy as np
-    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+def _val_at_tstar(model, dl, device, ema, k=5, grid=None, use_ema=True, debug=False):
+    import numpy as np
+    grid = (np.linspace(0.05, 0.95, 181) if (grid is None) else grid)
 
-    # Ensure we have a proper grid
-    if grid is None:
-        grid = np.linspace(0.05, 0.95, 181)  # 0.05..0.95 step 0.005
-    else:
-        grid = np.asarray(grid, dtype=float)
-
-    # Eval with EMA or current weights
-    ctx = ema.average_parameters(model) if use_ema else contextlib.nullcontext()
+    ctx = (ema.average_parameters(model) if (use_ema and ema is not None) else contextlib.nullcontext())
     with ctx:
-        v_logits, vy = eval_logits(model, loader, device=device)
-    vp = eval_prob_fn(v_logits)
+        v_logits, vy = eval_logits(model, dl, device=device)
+        vp_raw = eval_prob_fn(v_logits)
+        vp = _median_smooth_1d(vp_raw, k=k) if k and k > 1 else vp_raw
 
     if debug:
         print(f"[VAL DEBUG] grid_len={len(grid)}  grid_min/max={grid[0]:.3f}/{grid[-1]:.3f}")
-        print(f"[VAL DEBUG] p_raw min/mean/max: {vp.min():.3f}/{vp.mean():.3f}/{vp.max():.3f}")
+        print(f"[VAL DEBUG] p_raw min/mean/max: {vp_raw.min():.3f}/{vp_raw.mean():.3f}/{vp_raw.max():.3f}")
+        print(f"[VAL DEBUG] p_smooth min/mean/max: {vp.min():.3f}/{vp.mean():.3f}/{vp.max():.3f}")
 
-    vp_s = _median_smooth_1d(vp, k=k) if (k and k > 1) else vp
-    if debug:
-        print(f"[VAL DEBUG] p_smooth min/mean/max: {vp_s.min():.3f}/{vp_s.mean():.3f}/{vp_s.max():.3f}")
-
-    # Sweep thresholds for macro-F1 on smoothed probs
-    f1s = []
+    best_f1, best_t = -1.0, 0.5
     for t in grid:
-        yhat = (vp_s >= t).astype(int)
-        f1s.append(f1_score(vy, yhat, average=_choose_avg(vy), zero_division=0))
-    f1s = np.asarray(f1s)
-    idx = int(np.nanargmax(f1s))
-    t_star = float(grid[idx])
-    best_f1 = float(f1s[idx])
+        pred = (vp >= t).astype(int)
+        f1 = f1_score(vy, pred, average=_choose_avg(vy), zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_t = f1, float(t)
 
-    # Metrics at t*
-    yhat = (vp_s >= t_star).astype(int)
-    acc  = float(accuracy_score(vy, yhat))
-    prec = float(precision_score(vy, yhat, average=_choose_avg(vy), zero_division=0))
-    rec  = float(recall_score(vy, yhat, average=_choose_avg(vy), zero_division=0))
-
+    pred_best = (vp >= best_t).astype(int)
+    acc  = accuracy_score(vy, pred_best)
+    prec = precision_score(vy, pred_best, average=_choose_avg(vy), zero_division=0)
+    rec  = recall_score(vy, pred_best, average=_choose_avg(vy), zero_division=0)
     if debug:
-        print(f"[VAL DEBUG] t*={t_star:.3f} | F1={best_f1:.3f} | acc={acc:.3f} | pos_rate={yhat.mean():.3f}")
+        pos_rate = pred_best.mean()
+        print(f"[VAL DEBUG] t*={best_t:.3f} | F1={best_f1:.3f} | acc={acc:.3f} | pos_rate={pos_rate:.3f}")
 
-    return dict(f1=best_f1, t_star=t_star, acc=acc, prec=prec, rec=rec)
-
+    return {'f1': best_f1, 't_star': best_t, 'acc': acc, 'prec': prec, 'rec': rec}
+	
 def _test_at_tstar(model, loader, device, ema, t_star, k=5, groups=None):
     """
     Test under EMA-averaged weights with per-record median smoothing and given t*.
