@@ -3761,7 +3761,16 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
     val_acc  = best['acc']
     val_prec = best['prec']
     val_rec  = best['rec']
-
+    # Optional: derive an EMA-specific t* by tuning on VAL under EMA params
+    with ema.average_parameters(model):
+        v_logits_ema, vy_ema = eval_logits(model, dl_va, device=device)
+        vp_ema = eval_prob_fn(v_logits_ema)
+        vp_ema = _median_smooth_1d(vp_ema, k=5)
+        try:
+            t_star_ema, val_f1_ema = tune_threshold(vy_ema, vp_ema, THRESH_GRID)
+        except Exception:
+            t_star_ema, val_f1_ema = 0.5, float('nan')
+		
     # --- TEST (EMA weights + same t*, median smoothing, grouped) ---
     te_groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
     metrics_raw, cm_raw = _test_at_tstar_raw(model, dl_te, device, t_star_raw, k=5, groups=te_groups)
