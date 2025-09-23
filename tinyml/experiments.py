@@ -28,6 +28,8 @@ import ast
 import pandas as pd
 from typing import List, Tuple
 import pandas as pd
+import contextlib
+
 DATASET_REGISTRY = {}
 # Toggle: use class-balanced sampling in the TRAIN loader
 USE_WEIGHTED_SAMPLER = True
@@ -45,7 +47,94 @@ def line(): print("-"*80)
 import datetime, os
 RUN_STAMP = os.environ.get("RUN_STAMP", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
 
-	
+
+def _fake_quant_tensor(x, bits=8, eps=1e-8, symmetric=True):
+    if bits >= 32:  # effectively off
+        return x
+    x = torch.nan_to_num(x, 0.0, 0.0, 0.0).clamp(-1e6, 1e6)
+    if symmetric:
+        qmax = (1 << (bits - 1)) - 1
+        scale = x.detach().abs().max().clamp(min=eps) / qmax
+        q = torch.round(x / scale)
+        return (q * scale).clamp(-qmax*scale, qmax*scale)
+    else:
+        qmax = (1 << bits) - 1
+        xmin = x.detach().min(); xmax = x.detach().max()
+        scale = (xmax - xmin).clamp(min=eps) / qmax
+        q = torch.round((x - xmin) / scale)
+        return q * scale + xmin
+
+def attach_qat_api(model):
+    """
+    Adds:
+      - model.set_qat(bits)
+      - model.clear_qat()
+    Activation-only fake quant via forward hooks (safe & simple).
+    """
+    state = {'enabled': False, 'bits': 8, 'handles': []}
+
+    def _hook_out(_m, _inp, out):
+        if not state['enabled']:
+            return out
+        return _fake_quant_tensor(out, bits=state['bits'])
+
+    def set_qat(bits=8):
+        clear_qat()
+        state['bits'] = int(bits)
+        for m in model.modules():
+            if isinstance(m, (torch.nn.Conv1d, torch.nn.Linear, torch.nn.ReLU, torch.nn.LeakyReLU)):
+                h = m.register_forward_hook(_hook_out)
+                state['handles'].append(h)
+        state['enabled'] = True
+        print(f"[QAT] enabled with {state['bits']}-bit on {len(state['handles'])} hooks")
+
+    def clear_qat():
+        n = 0
+        for h in state['handles']:
+            try:
+                h.remove(); n += 1
+            except Exception:
+                pass
+        state['handles'].clear()
+        if state['enabled']:
+            print(f"[QAT] disabled (removed {n} hooks)")
+        state['enabled'] = False
+
+    model.set_qat = set_qat
+    model.clear_qat = clear_qat
+    model._qat_state = state
+    return model
+
+class ExponentialMovingAverage:
+    """Tiny EMA with a context manager to eval under EMA weights."""
+    def __init__(self, params, decay=0.999):
+        self.decay = float(decay)
+        self.shadow = {}
+        self.backup = {}
+        for p in params:
+            if p.requires_grad:
+                self.shadow[p] = p.detach().clone()
+
+    @torch.no_grad()
+    def update(self):
+        for p, s in self.shadow.items():
+            if p.requires_grad:
+                s.mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+
+    @contextlib.contextmanager
+    def average_parameters(self, model):
+        try:
+            self.backup.clear()
+            for p in model.parameters():
+                if p in self.shadow:
+                    self.backup[p] = p.data.clone()
+                    p.data.copy_(self.shadow[p])
+            yield
+        finally:
+            for p, b in self.backup.items():
+                p.data.copy_(b)
+            self.backup.clear()
+
 # --- Normalize different dataset returns to (tr, va, te, meta) ---
 def _normalize_dataset_return(ret):
     if isinstance(ret, (tuple, list)):
@@ -3193,6 +3282,12 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
         print(f'Failed to build model: {e}')
         return None
 
+    attach_qat_api(model)
+
+    # EMA for eval/export stability
+    ema_decay = float(model_kwargs.get("ema_decay", 0.999))
+    ema = ExponentialMovingAverage(model.parameters(), decay=ema_decay)
+
     model.to(device)
     params = count_params(model)
     flash_info = estimate_flash_usage(model, 'int8')
@@ -5409,35 +5504,39 @@ def run_one(spec):
 
     # occasional val read-out (thresholded F1)
     if (ep + 1) % max(1, spec['epochs'] // 3) == 0:
+        with ema.average_parameters(model):
+            v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
+            vp = eval_prob_fn(v_logits)
+            vp_smooth = _medfilt(vp, k=5)
+            t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
+            if val_f1 > best[0]:
+                best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
+            val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
+            print(f"{name} ep{ep+1}/{spec['epochs']}  tr_loss={tr_loss:.4f}  "
+                f"val_acc@t*={val_acc:.3f}  val_f1@t*={val_f1:.3f}  t*={t_star:.2f}")
+
+    # ----- final eval (tuned on val) -----
+    with ema.average_parameters(model):
         v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
         vp = eval_prob_fn(v_logits)
         vp_smooth = _medfilt(vp, k=5)
         t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
         if val_f1 > best[0]:
             best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
-        val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
-        print(f"{name} ep{ep+1}/{spec['epochs']}  tr_loss={tr_loss:.4f}  "
-              f"val_acc@t*={val_acc:.3f}  val_f1@t*={val_f1:.3f}  t*={t_star:.2f}")
 
-    # ----- final eval (tuned on val) -----
-    v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
-    vp = eval_prob_fn(v_logits)
-    vp_smooth = _medfilt(vp, k=5)
-    t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
-    if val_f1 > best[0]:
-        best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
+        if best[2] is not None:
+            model.load_state_dict(best[2])
+        t_star = best[1]
+    with ema.average_parameters(model):
+        te_logits, ty = eval_logits(model, dl_te, device=DEVICE)
+        tp_raw = eval_prob_fn(te_logits)
 
-    if best[2] is not None:
-        model.load_state_dict(best[2])
-    t_star = best[1]
+        # same smoothing used in tune_threshold (e.g., k=5)
+        tp = _median_smooth_1d(tp_raw, k=5)
+        yhat = (tp >= t_star).astype(int)
 
-    te_logits, ty = eval_logits(model, dl_te, device=DEVICE)
-    tp = eval_prob_fn(te_logits)
-    tp_smooth = _medfilt(tp, k=5)
-    yhat = (tp_smooth >= t_star).astype(int)
-
-    metrics = ec57_metrics_with_ci(ty, yhat)
-    cm = confusion_matrix(ty, yhat).tolist()
+        metrics = ec57_metrics_with_ci(ty, yhat)
+        cm = confusion_matrix(ty, yhat).tolist()
 
     # size & latency
     packed = packed_bytes_model_paper(model)
@@ -10235,13 +10334,17 @@ def run_one(spec):
 
     # simple EMA over epochs (per-step EMA would be stronger, but this is minimal-intrusion)
     ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-
+    qat_start_frac = float(model_kwargs.get("qat_start_frac", 0.5))
+    qat_bits       = int(model_kwargs.get("qat_bits", 6))
     for ep in range(spec['epochs']):
         # QAT: enable halfway through training if model exposes set_qat/clear_qat
         if hasattr(model, "set_qat"):
-            if ep >= int(qat_start_frac * spec['epochs']): 
-                model.set_qat(qat_bits)
-        else: 
+        use_qat = (ep >= int(qat_start_frac * spec['epochs']))
+        if use_qat and (not model._qat_state['enabled'] or model._qat_state['bits'] != qat_bits):
+            print(f"[QAT] toggling ON @ epoch {ep+1}/{spec['epochs']} (bits={qat_bits})")
+            model.set_qat(qat_bits)
+        if (not use_qat) and model._qat_state['enabled']:
+            print(f"[QAT] toggling OFF @ epoch {ep+1}/{spec['epochs']}")
             model.clear_qat()
 
         # KD or plain CE epoch
@@ -10269,6 +10372,8 @@ def run_one(spec):
                 model, dl_tr, opt, device=DEVICE, meta=meta, clip=1.0,
                 w_size=w_size, w_spec=w_spec, w_softf1=w_softf1,
             )
+        if 'opt' in locals():
+            ema.update()
 
         # EMA update (epoch-level)
         with torch.no_grad():
@@ -10277,38 +10382,43 @@ def run_one(spec):
 
         # occasional val read-out (thresholded F1) — keep this INSIDE the loop
         if (ep + 1) % max(1, spec['epochs'] // 3) == 0 or (ep + 1) == spec['epochs']:
-            v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
-            vp = eval_prob_fn(v_logits)
-            vp_smooth = _medfilt(vp, k=5)
-            t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
-            if val_f1 > best[0]:
-                best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
-            val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
-            print(f"{name} ep{ep+1}/{spec['epochs']}  tr_loss={tr_loss:.4f}  "
-                  f"val_acc@t*={val_acc:.3f}  val_f1@t*={val_f1:.3f}  t*={t_star:.2f}")
+            with ema.average_parameters(model):
+                v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
+                vp = eval_prob_fn(v_logits)
+                vp_smooth = _medfilt(vp, k=5)
+                t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
+                if val_f1 > best[0]:
+                    best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
+                val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
+                print(f"{name} ep{ep+1}/{spec['epochs']}  tr_loss={tr_loss:.4f}  "
+                    f"val_acc@t*={val_acc:.3f}  val_f1@t*={val_f1:.3f}  t*={t_star:.2f}")
 
     # ----- final eval (swap to EMA for eval) -----
     with torch.no_grad():
         raw_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         model.load_state_dict(ema_state, strict=False)
-
-    # choose best val state if it beat EMA snapshot
-    v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
-    vp = eval_prob_fn(v_logits)
-    vp_smooth = _medfilt(vp, k=5)
-    t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
-    if best[0] >= val_f1 and best[2] is not None:
-        model.load_state_dict(best[2])
-        t_star = best[1]
-        val_f1 = best[0]
+    with ema.average_parameters(model):
+        # choose best val state if it beat EMA snapshot
+        v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
+        vp = eval_prob_fn(v_logits)
+        vp_smooth = _medfilt(vp, k=5)
+        t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
+        if best[0] >= val_f1 and best[2] is not None:
+            model.load_state_dict(best[2])
+            t_star = best[1]
+            val_f1 = best[0]
 
     # test
-    te_logits, ty = eval_logits(model, dl_te, device=DEVICE)
-    tp = eval_prob_fn(te_logits)
-    yhat = (tp >= t_star).astype(int)
+    with ema.average_parameters(model):
+        te_logits, ty = eval_logits(model, dl_te, device=DEVICE)
+        tp_raw = eval_prob_fn(te_logits)
 
-    metrics = ec57_metrics_with_ci(ty, yhat)
-    cm = confusion_matrix(ty, yhat).tolist()
+        # same smoothing used in tune_threshold (e.g., k=5)
+        tp = _median_smooth_1d(tp_raw, k=5)
+        yhat = (tp >= t_star).astype(int)
+
+        metrics = ec57_metrics_with_ci(ty, yhat)
+        cm = confusion_matrix(ty, yhat).tolist()
 
     # size & latency
     packed = packed_bytes_model_paper(model)
