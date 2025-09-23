@@ -3269,19 +3269,27 @@ def _records_from_loader(dl):
     # first element of each tuple is record id
     return {t[0] for t in idx}
 # -------------------- Experiment Runner ----------------
-# ===== REPLACE: run_experiment (batched with safe builder & stability probes) =====
 def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
+    """
+    Single experiment runner (simple mode).
+    - Tunes a decision threshold on VAL (with median smoothing), evaluates TEST at that t*.
+    - Uses EMA-averaged weights for validation/test evaluation.
+    - Optionally toggles QAT mid-training if the model exposes set_qat().
+    - Pulls optional knobs from cfg.model_kwargs (ema_decay, qat_bits, qat_start_frac, use_focal, etc).
+    """
+    import time, copy
+    from collections import defaultdict
+
     print(f'\n{"="*60}')
     print(f' Experiment: {dataset_name} + {model_name}')
     print("="*60)
 
-    # Dataset availability
     if dataset_name not in available_datasets():
         print(f'Dataset {dataset_name} not in registry.')
         print(f'Available: {available_datasets()}')
         return None
 
-    # Prepare loaders
+    # ------------------ Data ------------------
     print(' Preparing data loaders...')
     try:
         ret = make_dataset_for_experiment(
@@ -3289,308 +3297,502 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
             limit=cfg.limit,
             batch_size=cfg.batch_size,
             target_fs=cfg.target_fs,
-            num_workers=cfg.num_workers,   # ok even if 0 (you removed pin/persistent)
+            num_workers=cfg.num_workers,
             length=cfg.length,
             window_ms=cfg.window_ms,
             input_len=cfg.input_len
         )
         dl_tr, dl_va, dl_te, meta = _normalize_dataset_return(ret)
-        tr_recs = _records_from_loader(dl_tr)
-        va_recs = _records_from_loader(dl_va)
-        te_recs = _records_from_loader(dl_te)
-        print("Split record counts:", len(tr_recs), len(va_recs), len(te_recs))
-        print("Overlap train∩val:", tr_recs & va_recs)
-        print("Overlap train∩test:", tr_recs & te_recs)
-        print("Overlap val∩test:", va_recs & te_recs)
 
-        # Probe meta if needed
+        # Fill missing meta
         need_probe = ("num_channels" not in meta) or ("num_classes" not in meta) or ("seq_len" not in meta)
         if need_probe:
             xb, yb = next(iter(dl_tr))
-            meta.setdefault("num_channels", int(xb.shape[1]))     # (B, C, T)
+            meta.setdefault("num_channels", int(xb.shape[1]))
             meta.setdefault("seq_len",     int(xb.shape[-1]))
             if yb.ndim == 1:
                 meta.setdefault("num_classes", int(max(2, yb.max().item() + 1)))
-            elif yb.ndim == 2:
-                meta.setdefault("num_classes", int(yb.shape[1]))
             else:
-                meta.setdefault("num_classes", 2)
-
+                meta.setdefault("num_classes", int(yb.shape[-1]))
         print(f' Dataset meta: {meta}')
         print(f' Train batches: {len(dl_tr)}, Val batches: {len(dl_va)}')
-
     except Exception as e:
         print(f'Failed to prepare dataset: {e}')
         return None
 
-    # Device & model
+    # ------------------ Build model ------------------
     device = torch.device(cfg.device)
-    in_ch = meta['num_channels']
-    num_classes = meta['num_classes']
+    in_ch, num_classes = meta['num_channels'], meta['num_classes']
+    model_kwargs = getattr(cfg, "model_kwargs", {}) or {}
 
     try:
-        model = safe_build_model(model_name, in_ch, num_classes)
+        model = safe_build_model(model_name, in_ch, num_classes, **model_kwargs)
     except Exception as e:
         print(f'Failed to build model: {e}')
         return None
 
-    attach_qat_api(model)
+    model.to(device)
 
-    # EMA for eval/export stability
+    # Optional QAT knobs + prints
+    qat_bits       = int(model_kwargs.get("qat_bits", 6))
+    qat_start_frac = float(model_kwargs.get("qat_start_frac", 0.5))
+    if hasattr(model, "set_qat"):
+        print(f"[QAT] model exposes set_qat(); will enable at {qat_start_frac:.2f} of training with {qat_bits}-bit.")
+    else:
+        print("[QAT] model has NO set_qat(); skipping QAT.")
+
+    # ------------------ EMA ------------------
     ema_decay = float(model_kwargs.get("ema_decay", 0.999))
     ema = ExponentialMovingAverage(model.parameters(), decay=ema_decay)
     print(f"[EMA] decay={ema_decay}")
-    model.to(device)
-    params = count_params(model)
-    flash_info = estimate_flash_usage(model, 'int8')
 
-    print(f' Model: {model_name}')
-    print(f' Parameters: {params:,}')
-    print(f' Flash estimate (INT8): {flash_info["flash_human"]} ({flash_info["flash_bytes"]:,} bytes)')
+    # ------------------ Opt ------------------
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
 
-    opt = Adam(model.parameters(), lr=cfg.lr)
-
-    # Diagnostics before training
-    print("\n🔧 NaN-Safe Training System Active")
+    # Diagnostics
     try:
-        sample_batch = next(iter(dl_tr))
-        sample_input = sample_batch[0][:1]
+        sample_input = next(iter(dl_tr))[0][:1]
         diagnose_nan_issues(model, sample_input, device)
-        fix_nan_issues(model)  # harmless if nothing to fix
-    except Exception as _:
+        fix_nan_issues(model)  # harmless if already clean
+    except Exception:
         pass
 
-    # Quick stability probe (few batches)
-    print(" Testing training stability with first few batches...")
-    model.train()
-    stable_training = True
-    for i, (xb, yb) in enumerate(dl_tr):
-        if i >= 3:
-            break
-        try:
-            xb, yb = xb.to(device), yb.to(device)
-            if torch.isnan(xb).any() or torch.isinf(xb).any():
-                print(f"  Batch {i}: Input has NaN/Inf - skipped")
-                continue
-            opt.zero_grad(set_to_none=True)
-            logits = model(xb)
-            if torch.isnan(logits).any() or torch.isinf(logits).any():
-                print(f"  Batch {i}: Logits NaN/Inf - stability issue")
-                stable_training = False
-                break
-            loss = F.cross_entropy(logits, yb)
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"  Batch {i}: Loss NaN/Inf - stability issue")
-                stable_training = False
-                break
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            print(f"  Batch {i}: Loss stable ({float(loss):.4f})")
-        except Exception as e:
-            print(f"  Batch {i}: Error - {e}")
-            stable_training = False
-            break
-
-    if not stable_training:
-        print(" Stability issues detected - applying emergency fixes...")
-        fix_nan_issues(model)
-        for pg in opt.param_groups:
-            pg['lr'] = min(pg['lr'], 1e-4)
-        print("   Applied emergency fixes.")
-
-    # Training loop
+    # ------------------ Train ------------------
     print(f' Training for {cfg.epochs} epochs...')
     start = time.time()
-    best_val_acc = 0.0
+    best = (-1.0, None, None)   # (val_f1, t_star, state_dict)
+    qat_armed = False
 
     for ep in range(cfg.epochs):
+        # Toggle QAT mid-training if available
+        if (not qat_armed) and ((ep + 1) / cfg.epochs) >= qat_start_frac:
+            if hasattr(model, "set_qat"):
+                try:
+                    model.set_qat(qat_bits)
+                    print(f"  [QAT] enabled at epoch {ep+1}/{cfg.epochs} with {qat_bits}-bit fake quant.")
+                except Exception as e:
+                    print(f"  [QAT] enable failed: {e}")
+            qat_armed = True
+
+        # One epoch (your trainer returns (loss, acc))
         train_loss, train_acc = train_epoch(model, dl_tr, opt, device=device)
-        val_acc, val_loss = evaluate(model, dl_va, device=device)
-        best_val_acc = max(best_val_acc, val_acc)
+
+        # EMA update at epoch end (per-step would be stronger; this is minimal-intrusion)
+        ema.update()
+
+        # Periodic EMA-eval on VAL with threshold tuning
+        with ema.average_parameters(model):
+            v_logits, vy = eval_logits(model, dl_va, device=device)
+        vp = eval_prob_fn(v_logits)
+        vp_smooth = _median_smooth_1d(vp, k=5)
+        t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
+
+        if val_f1 > best[0]:
+            best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
+
+        val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
         print(f'  Epoch {ep+1}/{cfg.epochs}: train_loss={train_loss:.4f} '
-              f'train_acc={train_acc:.4f} val_acc={val_acc:.4f}')
+              f'train_acc={train_acc:.4f} val_acc@t*={val_acc:.4f} val_f1@t*={val_f1:.4f} t*={t_star:.2f}')
 
     dur = time.time() - start
 
-    # Test evaluation
-    '''
-    test_acc = None
-    if dl_te is not None:
-        test_acc, _ = evaluate(model, dl_te, device=device)
-        print(f' Test accuracy: {test_acc:.4f}')
-    '''
-    v_logits, vy = evaluate_logits(model, dl_va, device=device)
-    vp = eval_prob_fn(v_logits)
-    vp_smooth = _medfilt(vp, k=5)
-    t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
+    # ------------------ Final: restore best snapshot, evaluate TEST under EMA ------------------
+    if best[2] is not None:
+        model.load_state_dict(best[2])
+    t_star = best[1]
+    with ema.average_parameters(model):
+        te_logits, ty = eval_logits(model, dl_te, device=device)
+        tp_raw = eval_prob_fn(te_logits)
+    tp = _median_smooth_1d(tp_raw, k=5)
+    yhat = (tp >= t_star).astype(int)
 
-    vy_hat = (vp >= t_star).astype(int)
-    _val_avg = _choose_avg(vy)  # or 'binary' if you prefer to force binary
-    val_precision = precision_score(vy, vy_hat, average=_val_avg, zero_division=0)
-    val_recall    = recall_score(vy, vy_hat, average=_val_avg, zero_division=0)
+    test_acc = accuracy_score(ty, yhat)
+    test_f1  = f1_score(ty, yhat, average=_choose_avg(ty), zero_division=0)
+    test_precision = precision_score(ty, yhat, average=_choose_avg(ty), zero_division=0)
+    test_recall    = recall_score(ty, yhat, average=_choose_avg(ty), zero_division=0)
+    print(f" Test P/R/F1@t*: {test_precision:.3f}/{test_recall:.3f}/{test_f1:.3f}")
 
-    # 2) Evaluate on test with the same threshold
-    test_acc = None; test_f1 = None
-    test_precision = None; test_recall = None
-    if dl_te is not None:
-        test_acc, _ = evaluate(model, dl_te, device=device)
-        try:
-            te_logits, ty = evaluate_logits(model, dl_te, device=device)
-            tp   = eval_prob_fn(te_logits)
-            tp_smooth = _medfilt(tp, k=5)
-            yhat = (tp_smooth >= t_star).astype(int)
-            _te_avg = _choose_avg(ty)  # or 'binary'
-            test_f1        = f1_score(ty, yhat, average=_te_avg, zero_division=0)
-            test_precision = precision_score(ty, yhat, average=_te_avg, zero_division=0)
-            test_recall    = recall_score(ty, yhat, average=_te_avg, zero_division=0)
-        except Exception:
-            pass
-    if dl_te is not None:
-        print(f" Test P/R/F1@t*: "
-              f"{(test_precision if test_precision is not None else float('nan')):.3f}/"
-              f"{(test_recall    if test_recall    is not None else float('nan')):.3f}/"
-              f"{(test_f1        if test_f1        is not None else float('nan')):.3f}")
-    print(f" Val  P/R/F1@t*: {val_precision:.3f}/{val_recall:.3f}/{val_f1:.3f}")
-    print(f" val_F1@t*={val_f1:.3f}  test_acc@t*={test_acc:.3f}  test_F1@t*={test_f1:.3f}  t*={t_star:.2f}")
-
+    # Deploy profile
     deploy = deployment_profile(model, meta, flash_bytes_fn=_flash_bytes_int8, device=str(device))
-
-    print(f'  Training time: {dur:.1f}s')
-    print(f' Best validation accuracy: {best_val_acc:.4f}')
-
     results = {
-          'dataset': dataset_name,
-          'model': _normalize_model_name(model_name),
-          'model_kwargs': model_kwargs,
-          'kd': kd,
-          'epochs': cfg.epochs,
-          'lr': cfg.lr,
+        'dataset': dataset_name,
+        'model': _normalize_model_name(model_name),
+        'model_kwargs': model_kwargs,
+        'kd': False,
+        'epochs': cfg.epochs,
+        'lr': cfg.lr,
 
-          'val_acc': best_val_acc,
-          'val_f1_at_t': val_f1,
-          'val_precision_at_t': float(val_precision),
-          'val_recall_at_t': float(val_recall),
+        'val_acc': float(val_acc),
+        'val_f1_at_t': float(best[0]),
+        'val_precision_at_t': float(precision_score(vy, (vp >= t_star).astype(int), average=_choose_avg(vy), zero_division=0)),
+        'val_recall_at_t': float(recall_score(vy, (vp >= t_star).astype(int), average=_choose_avg(vy), zero_division=0)),
 
-          'test_acc': test_acc,
-          'test_f1_at_t': test_f1,
-          'test_precision_at_t': test_precision,
-          'test_recall_at_t': test_recall,
+        'test_acc': float(test_acc),
+        'test_f1_at_t': float(test_f1),
+        'test_precision_at_t': float(test_precision),
+        'test_recall_at_t': float(test_recall),
 
-          'threshold_t': t_star,
-          'params': params,
-
-          'flash_kb': deploy['flash_kb'],
-          'ram_act_peak_kb': deploy['ram_act_peak_kb'],
-          'param_kb': deploy['param_kb'],
-          'buffer_kb': deploy['buffer_kb'],
-          'macs': deploy['macs'],
-          'latency_ms': deploy['latency_ms'],
-          'energy_mJ': deploy['energy_mJ'],
-
-          'train_time_s': dur,
-          'channels': meta.get('num_channels', None),
-          'seq_len': meta.get('seq_len', None),
-          'num_classes': meta.get('num_classes', None),
+        'threshold_t': float(t_star),
+        'params': int(count_params(model)),
+        'flash_kb': deploy['flash_kb'],
+        'ram_act_peak_kb': deploy['ram_act_peak_kb'],
+        'param_kb': deploy['param_kb'],
+        'buffer_kb': deploy['buffer_kb'],
+        'macs': deploy['macs'],
+        'latency_ms': deploy['latency_ms'],
+        'energy_mJ': deploy['energy_mJ'],
+        'train_time_s': float(dur),
+        'channels': meta.get('num_channels'),
+        'seq_len': meta.get('seq_len'),
+        'num_classes': meta.get('num_classes'),
     }
     return results
 
+def run_all_experiments(cfg: ExpCfg, datasets: List[str] = None):
+    """
+    Multi-dataset orchestrator (max test accuracy focus).
+    - Reuses loaders per dataset.
+    - Uses run_experiment_unified() to pick up KD/QAT/knobs in spec['kwargs'].
+    - Timestamped artifacts: size table, per-dataset CSVs, live + final combined CSV, Pareto PNG.
+    """
+    import pandas as pd
+    from datetime import datetime
 
-def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None):
-    # Datasets to run
+    # Resolve dataset list
+    avail = list(available_datasets())
     if datasets is None:
-        datasets = [d for d in available_datasets()]
-
-    all_specs = []
-    for ds in datasets:
-        if ds not in available_datasets(): continue
-        for spec in build_model_grid_for_dataset(ds):
-            all_specs.append((ds, spec))
-    total_exp = len(all_specs)
+        datasets = avail[:]
+    else:
+        datasets = [d for d in datasets if d in avail]
 
     print("\n" + "="*80)
     print(" UNIFIED TINYML EXPERIMENTS")
     print("="*80)
-    print("total_exp",total_exp)
     print(f" Datasets: {datasets}")
     print(f"  Config: epochs={cfg.epochs}, batch_size={cfg.batch_size}, limit={cfg.limit}, device={cfg.device}")
 
-    # Build one size table (probe first available dataset)
-    if datasets:
-        try:
-            df_size = build_size_table_one_dataset(datasets[0], cfg)
-        except Exception as e:
-            print(f"[WARN] Size table failed: {e}")
+    if not datasets:
+        print("No valid datasets to run.")
+        return None
 
-    all_results = []
-    total = 0
+    # Timestamped run subdir
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_subdir = f"run-{ts}"
+
+    # Build planned grids
+    plan = {ds: build_model_grid_for_dataset(ds) for ds in datasets}
+    total_planned = sum(len(v) for v in plan.values())
+    print(f"  Planned experiments: {total_planned}")
+
+    # One-time size table on first dataset
+    try:
+        first_ds = datasets[0]
+        df_size = build_size_table_one_dataset(first_ds, cfg)
+        save_df_both(df_size, f"model_size_packed_flash_{ts}.csv", subdir=run_subdir)
+        print(" Saved: model_size_packed_flash.csv")
+    except Exception as e:
+        print(f"[WARN] Size table failed: {e}")
+
+    all_rows = []
+    exp_counter = 0
+
     for ds in datasets:
-        if ds not in available_datasets():
-            print(f"  Skipping unavailable dataset: {ds}")
-            continue
-        grid = build_model_grid_for_dataset(ds)
-        total += len(grid)
+        grid = plan[ds]
+        # Build loaders once per dataset
+        dl_tr, dl_va, dl_te, meta = get_or_make_loaders_once(ds, cfg)
+        try:
+            print_class_dist_from_loaders(dl_tr, dl_va, dl_te, meta)
+        except Exception:
+            pass
 
-        #for spec in grid:
-        for i, (ds, spec) in enumerate(all_specs, start=1):
+        for spec in grid:
+            exp_counter += 1
             name   = spec['name']
-            kwargs = spec.get('kwargs', {})
-            kd     = spec.get('kd', False)
-            exp_id = make_exp_id(i, total_exp, ds, _normalize_model_name(name), kd, kwargs, seed=getattr(cfg, 'seed', None))
+            kwargs = dict(spec.get('kwargs', {}))
+            kd     = bool(spec.get('kd', False))
+            exp_id = make_exp_id(exp_counter, total_planned, ds, _normalize_model_name(name), kd, kwargs, seed=getattr(cfg, 'seed', None))
             print(f"\n📍 {exp_id}")
+
             try:
-                #res = run_experiment_unified(cfg, ds, name, model_kwargs=kwargs, kd=kd,
-                #                            w_size=1.0, w_bit=(0.05 if kd else 0.0),
-                 #w_spec=1e-4, w_softf1=0.10)
-                dl_tr, dl_va, dl_te, meta = get_or_make_loaders_once(ds, cfg)
-                print("Before printing ",dl_tr, dl_va, dl_te, meta)
-                print_class_dist_from_loaders(dl_tr, dl_va, dl_te, meta)
-                # pass these into run_experiment_unified instead of rebuilding
-                res = run_experiment_unified(cfg, ds, name, model_kwargs=kwargs, kd=kd,
-                                            loaders=(dl_tr, dl_va, dl_te, meta),
-                                            w_size=1.0, w_bit=(0.05 if kd else 0.0),
-                                            w_spec=1e-4, w_softf1=0.10)
+                # Reuse loaders for speed/consistency
+                res = run_experiment_unified(
+                    cfg, ds, name,
+                    model_kwargs=kwargs,
+                    kd=kd,
+                    loaders=(dl_tr, dl_va, dl_te, meta),
+                    w_size=1.0, w_bit=(0.05 if kd else 0.0), w_spec=1e-4, w_softf1=0.10
+                )
                 if res:
-                    res['exp_id'] = exp_id         # <- keep ID in the row
+                    res['exp_id']   = exp_id
                     res['exp_name'] = f"{ds}+{name}"
-                    all_results.append(res)
+                    all_rows.append(res)
+
+                    # rolling save
+                    df_live = pd.DataFrame(all_rows).sort_values('exp_id')
+                    save_df_both(df_live, f"comprehensive_tinyml_results_live_{ts}.csv", subdir=run_subdir)
             except Exception as e:
                 print(f"💥 {exp_id} failed: {e}")
                 import traceback; traceback.print_exc()
 
-    if not all_results:
+        # per-dataset snapshot
+        ds_rows = [r for r in all_rows if r.get('dataset') == ds]
+        if ds_rows:
+            df_ds = pd.DataFrame(ds_rows).sort_values('exp_id')
+            save_df_both(df_ds, f"results_{ds}_{ts}.csv", subdir=run_subdir)
+
+    if not all_rows:
         print("No experiments completed successfully")
         return None
 
-    df = pd.DataFrame(all_results).sort_values('exp_id')
-    # Pareto + summaries
+    # Final combined CSV + Pareto
+    df = pd.DataFrame(all_rows).sort_values('exp_id')
+    save_df_both(df, f"comprehensive_tinyml_results_{ts}.csv", subdir=run_subdir)
+    print(" Saved: comprehensive_tinyml_results.csv")
+
     try:
-        pf = plot_pareto(df, x='flash_kb', y='test_f1_at_t', save_path='pareto_accuracy_vs_flash.png')
+        pareto_png = f"pareto_accuracy_vs_flash_{ts}.png"
+        pf = plot_pareto(df, x='flash_kb', y='test_f1_at_t', save_path=pareto_png)
         print("\nPARETO FRONTIER (non-dominated points):")
-        print(pf[['model','flash_kb','test_f1_at_t']])
+        try:
+            print(pf[['model','flash_kb','test_f1_at_t']])
+        except Exception:
+            pass
+        with open(pareto_png, "rb") as f:
+            save_bytes_both(f.read(), pareto_png, subdir=run_subdir)
     except Exception as e:
         print(f"[WARN] Pareto plot failed: {e}")
 
+    # Summary
     print(f"\n{'='*80}")
     print(" EXPERIMENT RESULTS SUMMARY")
     print("="*80)
-    print(f" Completed runs: {len(all_results)}/{total}")
-    if 'val_acc' in df:
+    print(f" Completed runs: {len(all_rows)}/{total_planned}")
+    if 'val_acc' in df.columns:
         print(f"📈 Avg val acc: {df['val_acc'].mean():.4f} ± {df['val_acc'].std():.4f}")
-    if 'flash_kb' in df:
-        print(f" Avg model flash: {df['flash_kb'].mean():.1f} KB")
+    if 'test_f1_at_t' in df.columns:
+        print(f" Avg test macro-F1@t*: {df['test_f1_at_t'].mean():.4f}")
+    if 'flash_kb' in df.columns:
+        try:
+            print(f" Avg model flash: {df['flash_kb'].mean():.1f} KB")
+        except Exception:
+            pass
 
-    # Compact table
     cols = ['dataset','model','kd','model_kwargs','val_acc','test_acc','val_f1_at_t','test_f1_at_t',
             'flash_kb','params','macs','latency_ms','energy_mJ','train_time_s']
     cols = [c for c in cols if c in df.columns]
-    print("\nRESULTS TABLE")
-    print(df[cols].to_string(index=False, float_format='%.4f'))
-
-    # Save
-    save_df_to_drive(df, 'comprehensive_tinyml_results.csv')
-    print(" Saved: comprehensive_tinyml_results.csv")
+    if cols:
+        print("\nRESULTS TABLE")
+        print(df[cols].to_string(index=False, float_format='%.4f'))
     return df
+
+def run_one(spec):
+    """
+    One spec dict:
+      - name, dataset, model, epochs, lr, kd, kwargs
+    Strong test accuracy path:
+      - KD (optional teacher warmup)
+      - EMA eval + threshold tuning on VAL (median-smoothed probs)
+      - QAT toggle mid-training if model.set_qat exists
+    """
+    import copy, time
+
+    name, ds_key = spec['name'], spec['dataset']
+    model_name   = spec.get('model', spec.get('name'))
+    model_kwargs = dict(spec.get('kwargs', {}))  # training + arch knobs
+
+    if RUN_ONCE and already_done(name):
+        print(f"[SKIP] {name} (cached)")
+        return
+
+    print("="*60, f"\n Experiment: {name}\n", "="*60, sep="")
+    dl_tr, dl_va, dl_te, meta = make_loaders_from_legacy(ds_key, batch=64, verbose=True)
+    meta = _ensure_meta(meta, dl_tr)
+    print(f" Dataset meta: {meta}")
+    print(f" Train batches: {len(dl_tr)}, Val batches: {len(dl_va)}")
+
+    # Training knobs
+    kd_alpha       = float(model_kwargs.get("kd_alpha", 0.65))
+    kd_temp        = float(model_kwargs.get("kd_temp", 3.5))
+    feat_w         = float(model_kwargs.get("feat_loss_weight", 0.0))
+    ema_decay      = float(model_kwargs.get("ema_decay", 0.999))
+    qat_start_frac = float(model_kwargs.get("qat_start_frac", 0.5))
+    qat_bits       = int(model_kwargs.get("qat_bits", 6))
+
+    # ----- KD teacher -----
+    teacher = None
+    if spec.get('kd', False):
+        print(" Setting up teacher (RegularCNN1D) for KD...")
+        try:
+            in_ch = meta.get('num_channels', 1)
+            num_classes = meta.get('num_classes', 2)
+            teacher = safe_build_model("regular_cnn", in_ch, num_classes).to(DEVICE)
+        except Exception as e:
+            print(f"  Teacher build failed: {e} (continuing without KD)")
+            teacher = None
+
+        if teacher is not None:
+            t_opt = torch.optim.AdamW(teacher.parameters(), lr=spec['lr'])
+            t_epochs = max(3, DATASET_SPECS[ds_key]['epochs'] // 2)
+            for _ in range(t_epochs):
+                _ = train_epoch_ce(teacher, dl_tr, t_opt, device=DEVICE, meta=meta,
+                                   w_size=0.0, w_spec=0.0, w_softf1=0.0)
+            print(" Teacher ready.")
+
+    # ----- Student -----
+    print(f" Building student model: {model_name}  kwargs={model_kwargs}")
+    in_ch = meta.get('num_channels', 1)
+    num_classes = meta.get('num_classes', 2)
+    try:
+        model = safe_build_model(model_name, in_ch, num_classes, **model_kwargs).to(DEVICE)
+    except Exception as e:
+        print(f"  Student build failed: {e}")
+        save_json(name, {'status': 'failed_build', 'error': str(e), 'meta': meta})
+        return
+
+    if hasattr(model, "set_qat"):
+        print(f"[QAT] model exposes set_qat(); will enable at {qat_start_frac:.2f} with {qat_bits}-bit.")
+    else:
+        print("[QAT] model has NO set_qat(); skipping QAT.")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=spec['lr'])
+    ema = ExponentialMovingAverage(model.parameters(), decay=ema_decay)
+    print(f"[EMA] decay={ema_decay}")
+
+    # Trainer weights
+    w_size   = 1.0
+    w_bit    = 0.05 if teacher else 0.0
+    w_spec   = 1e-4
+    w_softf1 = 0.10
+
+    # Train
+    print(f" Training for {spec['epochs']} epochs...")
+    best = (-1.0, None, None)        # (val_f1, t_star, state_dict)
+    qat_armed = False
+
+    for ep in range(spec['epochs']):
+        # Enable QAT
+        if (not qat_armed) and ((ep + 1) / spec['epochs'] >= qat_start_frac):
+            if hasattr(model, "set_qat"):
+                try:
+                    model.set_qat(qat_bits)
+                    print(f"  [QAT] enabled at epoch {ep+1}/{spec['epochs']} with {qat_bits}-bit.")
+                except Exception as e:
+                    print(f"  [QAT] enable failed: {e}")
+            qat_armed = True
+
+        # Train one epoch (KD vs CE)
+        if teacher is not None:
+            tr_loss = kd_train_epoch(
+                student=model, teacher=teacher, loader=dl_tr, opt=opt,
+                T=kd_temp, alpha=kd_alpha, device=DEVICE, meta=meta, clip=1.0,
+                w_size=w_size, w_bit=w_bit, w_spec=w_spec, w_softf1=w_softf1,
+            )
+            if feat_w > 0 and hasattr(model, "_forward_features") and hasattr(teacher, "_forward_features"):
+                model.train()
+                xb, _ = next(iter(dl_tr))
+                xb = xb.to(DEVICE)
+                with torch.no_grad():
+                    t_feat = teacher._forward_features(xb)
+                s_feat = model._forward_features(xb)
+                hint_loss = F.mse_loss(s_feat, t_feat) * feat_w
+                opt.zero_grad(set_to_none=True)
+                hint_loss.backward()
+                opt.step()
+        else:
+            tr_loss = train_epoch_ce(
+                model, dl_tr, opt, device=DEVICE, meta=meta, clip=1.0,
+                w_size=w_size, w_spec=w_spec, w_softf1=w_softf1,
+            )
+
+        # EMA update (epoch-level)
+        ema.update()
+
+        # Periodic validation with EMA + threshold tuning
+        if (ep + 1) % max(1, spec['epochs'] // 3) == 0 or (ep + 1) == spec['epochs']:
+            with ema.average_parameters(model):
+                v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
+            vp = eval_prob_fn(v_logits)
+            vp_smooth = _median_smooth_1d(vp, k=5)
+            t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
+            if val_f1 > best[0]:
+                best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
+            val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
+            print(f"{name} ep{ep+1}/{spec['epochs']}  tr_loss={tr_loss:.4f}  "
+                  f"val_acc@t*={val_acc:.3f}  val_f1@t*={val_f1:.3f}  t*={t_star:.2f}")
+
+    # ----- Final eval with best snapshot under EMA -----
+    if best[2] is not None:
+        model.load_state_dict(best[2])
+    t_star = best[1]
+
+    with ema.average_parameters(model):
+        te_logits, ty = eval_logits(model, dl_te, device=DEVICE)
+        tp_raw = eval_prob_fn(te_logits)
+
+    tp = _median_smooth_1d(tp_raw, k=5)
+    yhat = (tp >= t_star).astype(int)
+
+    groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
+    metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
+    cm = confusion_matrix(ty, yhat).tolist()
+    print(f" New Test acc@t*={metrics['acc']:.4f} | macroF1@t*={metrics['macro_f1']:.4f} "
+          f"| balAcc@t*={metrics.get('balanced_acc', float('nan')):.4f} "
+          f"| AUC(raw)={metrics.get('auc_raw', None)}")
+
+    # Size & latency
+    packed = packed_bytes_model_paper(model)
+    T = DATASET_SPECS[ds_key]['T'] if ds_key in DATASET_SPECS else meta.get('seq_len', None)
+    inf_ms, boot_ms = proxy_latency_estimate(model, T=T)
+
+    payload = {
+        'exp': spec,
+        'threshold': float(t_star),
+        'val': {'macro_f1_at_t': float(best[0])},
+        'test': {**metrics, 'cm': cm},
+        'packed_bytes': int(packed),
+        'latency_ms': {'per_inference': inf_ms, 'boot_or_synth': boot_ms},
+        'device': str(DEVICE), 'meta': meta,
+        'test_acc_at_t': float(metrics['acc']),
+        'test_f1_at_t':  float(metrics['macro_f1']),
+    }
+    save_json(name, payload)
+    print_and_log(name, payload)
+    print(f" Success: {name}")
+
+
+def run_suite(parallel: bool = False, max_workers: int = None):
+    """
+    Run EXPERIMENTS (list of spec dicts).
+    - Sequential by default (deterministic). Threaded option for CPU-only speed-ups.
+    """
+    if not EXPERIMENTS:
+        print("No experiments defined for available datasets.")
+        return
+
+    names = [e['name'] for e in EXPERIMENTS]
+    print(f"Planned experiments: {names}")
+
+    if not parallel:
+        for spec in EXPERIMENTS:
+            run_one(spec)
+        return
+
+    # Parallel threads — PyTorch releases GIL during compute on CPU
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    max_workers = max_workers or min(8, len(EXPERIMENTS))
+
+    futures = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for spec in EXPERIMENTS:
+            futures[ex.submit(run_one, spec)] = spec['name']
+
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                fut.result()
+                print(f"[DONE] {name}")
+            except Exception as e:
+                print(f"[FAIL] {name} → {e}")
 
 def _stamp_str():
     """
@@ -5480,169 +5682,7 @@ def _ensure_meta(meta: Dict, dl_tr):
     else:
         meta.setdefault("num_classes", 2)
     return meta
-# One run with optional KD, periodic threshold-aware val metrics, and JSON output
-def run_one(spec):
-    name, ds_key = spec['name'], spec['dataset']
-    if RUN_ONCE and already_done(name):
-        print(f"[SKIP] {name} (cached)")
-        return
 
-    print("="*60, f"\n Experiment: {name}\n", "="*60, sep="")
-    dl_tr, dl_va, dl_te, meta = make_loaders_from_legacy(ds_key, batch=64, verbose=True)
-    meta = _ensure_meta(meta, dl_tr)
-    print(f" Dataset meta: {meta}")
-    print(f" Train batches: {len(dl_tr)}, Val batches: {len(dl_va)}")
-
-    # ----- optional KD teacher -----
-    teacher = None
-    if spec.get('kd', False):
-        print(" Setting up teacher (RegularCNN1D) for KD...")
-        try:
-            in_ch = meta.get('num_channels', 1)
-            num_classes = meta.get('num_classes', 2)
-            # build safe & swap BN→GN
-            teacher = safe_build_model("regular_cnn", in_ch, num_classes).to(DEVICE)
-        except Exception as e:
-            print(f"  Teacher build failed: {e} (continuing without KD)")
-            teacher = None
-        '''
-        if teacher is not None:
-            t_opt = torch.optim.AdamW(teacher.parameters(), lr=spec['lr'])
-            t_epochs = max(3, DATASET_SPECS[ds_key]['epochs']//2)
-            for _ in range(t_epochs):
-                train_fn = globals().get('train_epoch', train_epoch_ce)
-                _ = train_fn(teacher, dl_tr, t_opt, device=DEVICE)  # ensure your train_epoch signature accepts device
-            print(" Teacher ready.")
-        '''
-        if teacher is not None:
-          t_opt = torch.optim.AdamW(teacher.parameters(), lr=spec['lr'])
-          t_epochs = max(3, DATASET_SPECS[ds_key]['epochs']//2)
-          for _ in range(t_epochs):
-              # use the CE trainer; no resource/spec/F1 on the teacher
-              _ = train_epoch_ce(teacher, dl_tr, t_opt, device=DEVICE, meta=meta,
-                                w_size=0.0, w_spec=0.0, w_softf1=0.0)
-          print(" Teacher ready.")
-    # ----- student model -----
-    print(f" Building student model: {spec['model']}")
-    in_ch = meta.get('num_channels', 1)
-    num_classes = meta.get('num_classes', 2)
-    try:
-        model = safe_build_model(spec['model'], in_ch, num_classes).to(DEVICE)
-    except Exception as e:
-        print(f"  Student build failed: {e}")
-        save_json(name, {'status': 'failed_build', 'error': str(e), 'meta': meta})
-        return
-
-    opt = torch.optim.AdamW(model.parameters(), lr=spec['lr'])
-
-    # choose trainer (your custom if present)
-    train_fn = globals().get('train_epoch', train_epoch_ce)
-
-    # ----- training -----
-    print(f" Training for {spec['epochs']} epochs...")
-    best = (-1.0, None, None)  # (val_f1, t_star, state_dict)
-    w_size   = 1.0                       # resource (L1) pressure on student
-    w_bit    = 0.05 if teacher else 0.0  # bit-aware KD only matters when KD is on
-    w_spec   = 1e-4                      # spectral leakage penalty (very light)
-    w_softf1 = 0.10                      # soft-F1 auxiliary (imbalance-friendly)
-    for ep in range(spec['epochs']):
-      if teacher is not None:
-          tr_loss = kd_train_epoch(student=model, teacher=teacher, loader=dl_tr, opt=opt,
-                              T=2.0, alpha=0.7, device=DEVICE, meta=meta, clip=1.0,
-                              w_size=w_size, w_bit=w_bit, w_spec=w_spec, w_softf1=w_softf1)
-      else:
-          tr_loss = train_epoch_ce(model, dl_tr, opt, device=DEVICE, meta=meta, clip=1.0,
-                              w_size=w_size, w_spec=w_spec, w_softf1=w_softf1)
-
-    # occasional val read-out (thresholded F1)
-    if (ep + 1) % max(1, spec['epochs'] // 3) == 0:
-        with ema.average_parameters(model):
-            v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
-            vp = eval_prob_fn(v_logits)
-            vp_smooth = _medfilt(vp, k=5)
-            t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
-            if val_f1 > best[0]:
-                best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
-            val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
-            print(f"{name} ep{ep+1}/{spec['epochs']}  tr_loss={tr_loss:.4f}  "
-                f"val_acc@t*={val_acc:.3f}  val_f1@t*={val_f1:.3f}  t*={t_star:.2f}")
-
-    # ----- final eval (tuned on val) -----
-    with ema.average_parameters(model):
-        v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
-        vp = eval_prob_fn(v_logits)
-        vp_smooth = _medfilt(vp, k=5)
-        t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
-        if val_f1 > best[0]:
-            best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
-
-        if best[2] is not None:
-            model.load_state_dict(best[2])
-        t_star = best[1]
-    with ema.average_parameters(model):
-        te_logits, ty = eval_logits(model, dl_te, device=DEVICE)
-        tp_raw = eval_prob_fn(te_logits)
-
-        # same smoothing used in tune_threshold (e.g., k=5)
-        tp = _median_smooth_1d(tp_raw, k=5)
-        yhat = (tp >= t_star).astype(int)
-
-        groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
-        metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
-        cm = confusion_matrix(ty, yhat).tolist()
-        print(f"[TEST] F1@t*={metrics['macro_f1']:.3f} (CI {metrics['macro_f1_ci']}) | "f"BalAcc={metrics['balanced_acc']:.3f} | AUC(raw)={metrics['auc_raw']}")
-    # size & latency
-    packed = packed_bytes_model_paper(model)
-    inf_ms, boot_ms = proxy_latency_estimate(model, T=DATASET_SPECS[ds_key]['T'])
-
-    payload = {
-        'exp': spec,
-        'threshold': float(t_star),
-        'val': {'macro_f1_at_t': float(val_f1)},
-        'test': {**metrics, 'cm': cm},
-        'packed_bytes': int(packed),
-        'latency_ms': {'per_inference': inf_ms, 'boot_or_synth': boot_ms},
-        'device': str(DEVICE), 'meta': meta,
-         'test_acc_at_t': metrics['acc'],
-        'test_f1_at_t':  metrics['macro_f1'],
-    }
-    save_json(name, payload)
-    print_and_log(name, payload)
-    print(f" Success: {name}")
-
-def run_suite(parallel: bool = False, max_workers: int = None):
-    """
-    Runs EXPERIMENTS sequentially by default.
-    Set parallel=True to run with a ThreadPool (safer in notebooks than processes).
-    """
-    if not EXPERIMENTS:
-        print("No experiments defined for available datasets.")
-        return
-
-    names = [e['name'] for e in EXPERIMENTS]
-    print(f"Planned experiments: {names}")
-
-    if not parallel:
-        for spec in EXPERIMENTS:
-            run_one(spec)
-        return
-
-    # Parallel (threads) — PyTorch releases the GIL during compute, so this helps on CPU.
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    max_workers = max_workers or min(8, len(EXPERIMENTS))
-
-    futures = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for spec in EXPERIMENTS:
-            futures[ex.submit(run_one, spec)] = spec['name']
-
-        for fut in as_completed(futures):
-            name = futures[fut]
-            try:
-                fut.result()
-                print(f"[DONE] {name}")
-            except Exception as e:
-                print(f"[FAIL] {name} → {e}")
 def get_loaders(ds_key, batch=64, verbose=True, force_reload=False):
     """
     Returns (dl_tr, dl_va, dl_te, meta) with caching keyed by (ds_key, batch).
@@ -8415,316 +8455,6 @@ def _records_from_loader(dl):
 # -------------------- Experiment Runner ----------------
 # ===== REPLACE: run_experiment (batched with safe builder & stability probes) =====
 
-def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
-    print(f'\n{"="*60}')
-    print(f' Experiment: {dataset_name} + {model_name}')
-    print("="*60)
-
-    # Dataset availability
-    if dataset_name not in available_datasets():
-        print(f'Dataset {dataset_name} not in registry.')
-        print(f'Available: {available_datasets()}')
-        return None
-
-    # Prepare loaders
-    print(' Preparing data loaders...')
-    try:
-        ret = make_dataset_for_experiment(
-            dataset_name,
-            limit=cfg.limit,
-            batch_size=cfg.batch_size,
-            target_fs=cfg.target_fs,
-            num_workers=cfg.num_workers,   # ok even if 0 (you removed pin/persistent)
-            length=cfg.length,
-            window_ms=cfg.window_ms,
-            input_len=cfg.input_len
-        )
-        dl_tr, dl_va, dl_te, meta = _normalize_dataset_return(ret)
-        tr_recs = _records_from_loader(dl_tr)
-        va_recs = _records_from_loader(dl_va)
-        te_recs = _records_from_loader(dl_te)
-        print("Split record counts:", len(tr_recs), len(va_recs), len(te_recs))
-        print("Overlap train∩val:", tr_recs & va_recs)
-        print("Overlap train∩test:", tr_recs & te_recs)
-        print("Overlap val∩test:", va_recs & te_recs)
-
-        # Probe meta if needed
-        need_probe = ("num_channels" not in meta) or ("num_classes" not in meta) or ("seq_len" not in meta)
-        if need_probe:
-            xb, yb = next(iter(dl_tr))
-            meta.setdefault("num_channels", int(xb.shape[1]))     # (B, C, T)
-            meta.setdefault("seq_len",     int(xb.shape[-1]))
-            if yb.ndim == 1:
-                meta.setdefault("num_classes", int(max(2, yb.max().item() + 1)))
-            elif yb.ndim == 2:
-                meta.setdefault("num_classes", int(yb.shape[1]))
-            else:
-                meta.setdefault("num_classes", 2)
-
-        print(f' Dataset meta: {meta}')
-        print(f' Train batches: {len(dl_tr)}, Val batches: {len(dl_va)}')
-
-    except Exception as e:
-        print(f'Failed to prepare dataset: {e}')
-        return None
-
-    # Device & model
-    device = torch.device(cfg.device)
-    in_ch = meta['num_channels']
-    num_classes = meta['num_classes']
-
-    try:
-        model = safe_build_model(model_name, in_ch, num_classes)
-    except Exception as e:
-        print(f'Failed to build model: {e}')
-        return None
-
-    model.to(device)
-    params = count_params(model)
-    flash_info = estimate_flash_usage(model, 'int8')
-
-    print(f' Model: {model_name}')
-    print(f' Parameters: {params:,}')
-    print(f' Flash estimate (INT8): {flash_info["flash_human"]} ({flash_info["flash_bytes"]:,} bytes)')
-
-    opt = Adam(model.parameters(), lr=cfg.lr)
-
-    # Diagnostics before training
-    print("\n🔧 NaN-Safe Training System Active")
-    try:
-        sample_batch = next(iter(dl_tr))
-        sample_input = sample_batch[0][:1]
-        diagnose_nan_issues(model, sample_input, device)
-        fix_nan_issues(model)  # harmless if nothing to fix
-    except Exception as _:
-        pass
-
-    # Quick stability probe (few batches)
-    print(" Testing training stability with first few batches...")
-    model.train()
-    stable_training = True
-    for i, (xb, yb) in enumerate(dl_tr):
-        if i >= 3:
-            break
-        try:
-            xb, yb = xb.to(device), yb.to(device)
-            if torch.isnan(xb).any() or torch.isinf(xb).any():
-                print(f"  Batch {i}: Input has NaN/Inf - skipped")
-                continue
-            opt.zero_grad(set_to_none=True)
-            logits = model(xb)
-            if torch.isnan(logits).any() or torch.isinf(logits).any():
-                print(f"  Batch {i}: Logits NaN/Inf - stability issue")
-                stable_training = False
-                break
-            loss = F.cross_entropy(logits, yb)
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"  Batch {i}: Loss NaN/Inf - stability issue")
-                stable_training = False
-                break
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            print(f"  Batch {i}: Loss stable ({float(loss):.4f})")
-        except Exception as e:
-            print(f"  Batch {i}: Error - {e}")
-            stable_training = False
-            break
-
-    if not stable_training:
-        print(" Stability issues detected - applying emergency fixes...")
-        fix_nan_issues(model)
-        for pg in opt.param_groups:
-            pg['lr'] = min(pg['lr'], 1e-4)
-        print("   Applied emergency fixes.")
-
-    # Training loop
-    print(f' Training for {cfg.epochs} epochs...')
-    start = time.time()
-    best_val_acc = 0.0
-
-    for ep in range(cfg.epochs):
-        train_loss, train_acc = train_epoch(model, dl_tr, opt, device=device)
-        val_acc, val_loss = evaluate(model, dl_va, device=device)
-        best_val_acc = max(best_val_acc, val_acc)
-        print(f'  Epoch {ep+1}/{cfg.epochs}: train_loss={train_loss:.4f} '
-              f'train_acc={train_acc:.4f} val_acc={val_acc:.4f}')
-
-    dur = time.time() - start
-
-    # Test evaluation
-    '''
-    test_acc = None
-    if dl_te is not None:
-        test_acc, _ = evaluate(model, dl_te, device=device)
-        print(f' Test accuracy: {test_acc:.4f}')
-    '''
-    v_logits, vy = evaluate_logits(model, dl_va, device=device)
-    vp = eval_prob_fn(v_logits)
-    vp_smooth = _medfilt(vp, k=5)
-    t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
-
-    vy_hat = (vp >= t_star).astype(int)
-    _val_avg = _choose_avg(vy)  # or 'binary' if you prefer to force binary
-    val_precision = precision_score(vy, vy_hat, average=_val_avg, zero_division=0)
-    val_recall    = recall_score(vy, vy_hat, average=_val_avg, zero_division=0)
-
-    # 2) Evaluate on test with the same threshold
-    test_acc = None; test_f1 = None
-    test_precision = None; test_recall = None
-    if dl_te is not None:
-        test_acc, _ = evaluate(model, dl_te, device=device)
-        try:
-            te_logits, ty = evaluate_logits(model, dl_te, device=device)
-            tp   = eval_prob_fn(te_logits)
-            yhat = (tp >= t_star).astype(int)
-            _te_avg = _choose_avg(ty)  # or 'binary'
-            test_f1        = f1_score(ty, yhat, average=_te_avg, zero_division=0)
-            test_precision = precision_score(ty, yhat, average=_te_avg, zero_division=0)
-            test_recall    = recall_score(ty, yhat, average=_te_avg, zero_division=0)
-        except Exception:
-            pass
-    if dl_te is not None:
-        print(f" Test P/R/F1@t*: "
-              f"{(test_precision if test_precision is not None else float('nan')):.3f}/"
-              f"{(test_recall    if test_recall    is not None else float('nan')):.3f}/"
-              f"{(test_f1        if test_f1        is not None else float('nan')):.3f}")
-    print(f" Val  P/R/F1@t*: {val_precision:.3f}/{val_recall:.3f}/{val_f1:.3f}")
-    print(f" val_F1@t*={val_f1:.3f}  test_acc@t*={test_acc:.3f}  test_F1@t*={test_f1:.3f}  t*={t_star:.2f}")
-
-    deploy = deployment_profile(model, meta, flash_bytes_fn=_flash_bytes_int8, device=str(device))
-
-    print(f'  Training time: {dur:.1f}s')
-    print(f' Best validation accuracy: {best_val_acc:.4f}')
-
-    results = {
-          'dataset': dataset_name,
-          'model': _normalize_model_name(model_name),
-          'model_kwargs': model_kwargs,
-          'kd': kd,
-          'epochs': cfg.epochs,
-          'lr': cfg.lr,
-
-          'val_acc': best_val_acc,
-          'val_f1_at_t': val_f1,
-          'val_precision_at_t': float(val_precision),
-          'val_recall_at_t': float(val_recall),
-
-          'test_acc': test_acc,
-          'test_f1_at_t': test_f1,
-          'test_precision_at_t': test_precision,
-          'test_recall_at_t': test_recall,
-
-          'threshold_t': t_star,
-          'params': params,
-
-          'flash_kb': deploy['flash_kb'],
-          'ram_act_peak_kb': deploy['ram_act_peak_kb'],
-          'param_kb': deploy['param_kb'],
-          'buffer_kb': deploy['buffer_kb'],
-          'macs': deploy['macs'],
-          'latency_ms': deploy['latency_ms'],
-          'energy_mJ': deploy['energy_mJ'],
-
-          'train_time_s': dur,
-          'channels': meta.get('num_channels', None),
-          'seq_len': meta.get('seq_len', None),
-          'num_classes': meta.get('num_classes', None),
-    }
-    return results
-
-
-
-from itertools import product
-
-def run_all_experiments(cfg: ExpCfg, datasets: List[str]=None):
-    # Datasets to run
-    if datasets is None:
-        datasets = [d for d in available_datasets()]
-
-    # Build full spec list once
-    all_specs = []
-    for ds in datasets:
-        if ds not in available_datasets():
-            continue
-        grid = build_model_grid_for_dataset(ds)   # <-- uses the function below
-        for spec in grid:
-            all_specs.append((ds, spec))
-    total_exp = len(all_specs)
-
-    print("\n" + "="*80)
-    print(" UNIFIED TINYML EXPERIMENTS")
-    print("="*80)
-    print(f" Datasets: {datasets}")
-    print(f"  Config: epochs={cfg.epochs}, batch_size={cfg.batch_size}, limit={cfg.limit}, device={cfg.device}")
-    print(f"  Planned experiments: {total_exp}")
-
-    # Optional: size table for the first dataset (best-effort)
-    if datasets:
-        try:
-            df_size = build_size_table_one_dataset(datasets[0], cfg)
-        except Exception as e:
-            print(f"[WARN] Size table failed: {e}")
-
-    all_results = []
-    for i, (ds_name, spec) in enumerate(all_specs, start=1):
-        name   = spec['name']
-        kwargs = spec.get('kwargs', {})
-        kd     = spec.get('kd', False)
-        exp_id = make_exp_id(i, total_exp, ds_name, _normalize_model_name(name), kd, kwargs, seed=getattr(cfg, 'seed', None))
-        print(f"\n📍 {exp_id}")
-        try:
-            dl_tr, dl_va, dl_te, meta = get_or_make_loaders_once(ds_name, cfg)
-            print_class_dist_from_loaders(dl_tr, dl_va, dl_te, meta)
-            res = run_experiment_unified(
-                cfg, ds_name, name, model_kwargs=kwargs, kd=kd,
-                loaders=(dl_tr, dl_va, dl_te, meta),
-                # loss weights consistent with your current defaults:
-                w_size=1.0, w_bit=(0.05 if kd else 0.0),
-                w_spec=1e-4, w_softf1=0.10
-            )
-            if res:
-                res['exp_id']   = exp_id
-                res['exp_name'] = f"{ds_name}+{name}"
-                all_results.append(res)
-        except Exception as e:
-            print(f"💥 {exp_id} failed: {e}")
-            import traceback; traceback.print_exc()
-
-    if not all_results:
-        print("No experiments completed successfully")
-        return None
-
-    df = pd.DataFrame(all_results).sort_values('exp_id')
-
-    # Pareto + summaries (best-effort)
-    try:
-        pf = plot_pareto(df, x='flash_kb', y='test_f1_at_t', save_path='pareto_accuracy_vs_flash.png')
-        print("\nPARETO FRONTIER (non-dominated points):")
-        print(pf[['model','flash_kb','test_f1_at_t']])
-    except Exception as e:
-        print(f"[WARN] Pareto plot failed: {e}")
-
-    print(f"\n{'='*80}")
-    print(" EXPERIMENT RESULTS SUMMARY")
-    print("="*80)
-    print(f" Completed runs: {len(all_results)}/{total_exp}")
-    if 'val_acc' in df:
-        print(f"📈 Avg val acc: {df['val_acc'].mean():.4f} ± {df['val_acc'].std():.4f}")
-    if 'flash_kb' in df:
-        print(f" Avg model flash: {df['flash_kb'].mean():.1f} KB")
-
-    cols = ['dataset','model','kd','model_kwargs','val_acc','test_acc','val_f1_at_t','test_f1_at_t',
-            'flash_kb','params','macs','latency_ms','energy_mJ','train_time_s']
-    cols = [c for c in cols if c in df.columns]
-    print("\nRESULTS TABLE")
-    print(df[cols].to_string(index=False, float_format='%.4f'))
-
-    save_df_to_drive(df, 'comprehensive_tinyml_results.csv')
-    print(" Saved: comprehensive_tinyml_results.csv")
-    return df
-# -------------------- Quick Test & Utility Functions ----------------
-
 def quick_test():
     """Run a quick test with minimal config to verify everything works"""
     print(" Running quick test...")
@@ -10356,198 +10086,6 @@ def _medfilt(p, k=5):
     import numpy as np
     from scipy.signal import medfilt
     return medfilt(p, kernel_size=k) if len(p) >= k else p
-
-
-def run_one(spec):
-    """
-    spec keys expected:
-      - 'name': str (experiment id)
-      - 'dataset': str ('apnea_ecg' | 'ptbxl' | 'mitdb')
-      - 'model': str (e.g., 'tiny_method', 'resnet1d_small', ...)
-      - 'epochs': int
-      - 'lr': float
-      - 'kd': bool
-      - 'kwargs': dict  <-- per-model/training knobs (dz, dh, use_focal, qat_bits, kd_alpha, kd_temp, ...)
-    """
-    name, ds_key = spec['name'], spec['dataset']
-    model_name   = spec.get('model', spec.get('name'))  # keep backward-compat
-    model_kwargs = dict(spec.get('kwargs', {}))         # <-- READ KWARGS HERE
-
-    if RUN_ONCE and already_done(name):
-        print(f"[SKIP] {name} (cached)")
-        return
-
-    print("="*60, f"\n Experiment: {name}\n", "="*60, sep="")
-    dl_tr, dl_va, dl_te, meta = make_loaders_from_legacy(ds_key, batch=64, verbose=True)
-    meta = _ensure_meta(meta, dl_tr)
-    print(f" Dataset meta: {meta}")
-    print(f" Train batches: {len(dl_tr)}, Val batches: {len(dl_va)}")
-
-    # ---- training knobs (with defaults) pulled from spec['kwargs'] ----
-    kd_alpha       = float(model_kwargs.get("kd_alpha", 0.65))
-    kd_temp        = float(model_kwargs.get("kd_temp", 3.5))
-    feat_w         = float(model_kwargs.get("feat_loss_weight", 0.0))
-    qat_start_frac = float(model_kwargs.get("qat_start_frac", 0.5))
-    qat_bits       = int(model_kwargs.get("qat_bits", 6))
-    ema_decay      = float(model_kwargs.get("ema_decay", 0.999))
-    use_focal      = bool(model_kwargs.get("use_focal", True))
-
-    # ----- optional KD teacher -----
-    teacher = None
-    if spec.get('kd', False):
-        print(" Setting up teacher (RegularCNN1D) for KD...")
-        try:
-            in_ch = meta.get('num_channels', 1)
-            num_classes = meta.get('num_classes', 2)
-            # teacher: larger reference; BN->GN handled inside safe_build_model (your version does this)
-            teacher = safe_build_model("regular_cnn", in_ch, num_classes).to(DEVICE)
-        except Exception as e:
-            print(f"  Teacher build failed: {e} (continuing without KD)")
-            teacher = None
-
-        # (Optional) warm up the teacher briefly if you don't have a checkpoint
-        if teacher is not None:
-            t_opt = torch.optim.AdamW(teacher.parameters(), lr=spec['lr'])
-            t_epochs = max(3, DATASET_SPECS[ds_key]['epochs'] // 2)
-            for _ in range(t_epochs):
-                _ = train_epoch_ce(teacher, dl_tr, t_opt, device=DEVICE, meta=meta,
-                                   w_size=0.0, w_spec=0.0, w_softf1=0.0)  # quick CE warmup
-            print(" Teacher ready.")
-
-    # ----- student model -----
-    print(f" Building student model: {model_name}  kwargs={model_kwargs}")
-    in_ch = meta.get('num_channels', 1)
-    num_classes = meta.get('num_classes', 2)
-    try:
-        # PASS KWARGS INTO THE BUILDER
-        model = safe_build_model(model_name, in_ch, num_classes, **model_kwargs).to(DEVICE)
-    except Exception as e:
-        print(f"  Student build failed: {e}")
-        save_json(name, {'status': 'failed_build', 'error': str(e), 'meta': meta})
-        return
-
-    opt = torch.optim.AdamW(model.parameters(), lr=spec['lr'])
-    # choose trainer (fallback to CE trainer if your custom isn't present)
-    train_fn = globals().get('train_epoch', train_epoch_ce)
-
-    # ----- training loop with QAT toggle + EMA -----
-    print(f" Training for {spec['epochs']} epochs...")
-    best = (-1.0, None, None)  # (val_f1, t_star, state_dict)
-    w_size   = 1.0                       # resource (L1) pressure on student
-    w_bit    = 0.05 if teacher else 0.0  # bit-aware KD weight only when KD is on
-    w_spec   = 1e-4                      # spectral leakage penalty (very light)
-    w_softf1 = 0.10                      # soft-F1 auxiliary
-
-    # simple EMA over epochs (per-step EMA would be stronger, but this is minimal-intrusion)
-    ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    qat_start_frac = float(model_kwargs.get("qat_start_frac", 0.5))
-    qat_bits       = int(model_kwargs.get("qat_bits", 6))
-    for ep in range(spec['epochs']):
-        # QAT: enable halfway through training if model exposes set_qat/clear_qat
-        if hasattr(model, "set_qat"):
-            use_qat = (ep >= int(qat_start_frac * spec['epochs']))
-            if use_qat and (not model._qat_state['enabled'] or model._qat_state['bits'] != qat_bits):
-                print(f"[QAT] toggling ON @ epoch {ep+1}/{spec['epochs']} (bits={qat_bits})")
-                model.set_qat(qat_bits)
-            elif (not use_qat) and model._qat_state['enabled']:
-                print(f"[QAT] toggling OFF @ epoch {ep+1}/{spec['epochs']}")
-                model.clear_qat()
-
-        # KD or plain CE epoch
-        if teacher is not None:
-            tr_loss = kd_train_epoch(
-                student=model, teacher=teacher, loader=dl_tr, opt=opt,
-                T=kd_temp, alpha=kd_alpha, device=DEVICE, meta=meta, clip=1.0,
-                w_size=w_size, w_bit=w_bit, w_spec=w_spec, w_softf1=w_softf1,
-            )
-            # optional: feature hint if your kd_train_epoch doesn't handle it
-            if feat_w > 0 and hasattr(model, "_forward_features") and hasattr(teacher, "_forward_features"):
-                # quick extra pass for hinting (cheap approximation)
-                model.train()
-                xb, yb = next(iter(dl_tr))
-                xb = xb.to(DEVICE)
-                with torch.no_grad():
-                    t_feat = teacher._forward_features(xb)  # type: ignore[attr-defined]
-                s_feat = model._forward_features(xb)        # type: ignore[attr-defined]
-                hint_loss = F.mse_loss(s_feat, t_feat) * feat_w
-                opt.zero_grad(set_to_none=True)
-                hint_loss.backward()
-                opt.step()
-        else:
-            tr_loss = train_epoch_ce(
-                model, dl_tr, opt, device=DEVICE, meta=meta, clip=1.0,
-                w_size=w_size, w_spec=w_spec, w_softf1=w_softf1,
-            )
-        if 'opt' in locals():
-            ema.update()
-
-        # EMA update (epoch-level)
-        with torch.no_grad():
-            for k, v in model.state_dict().items():
-                ema_state[k].mul_(ema_decay).add_(v.detach(), alpha=(1.0 - ema_decay))
-
-        # occasional val read-out (thresholded F1) — keep this INSIDE the loop
-        if (ep + 1) % max(1, spec['epochs'] // 3) == 0 or (ep + 1) == spec['epochs']:
-            with ema.average_parameters(model):
-                v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
-                vp = eval_prob_fn(v_logits)
-                vp_smooth = _medfilt(vp, k=5)
-                t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
-                if val_f1 > best[0]:
-                    best = (val_f1, t_star, copy.deepcopy(model.state_dict()))
-                val_acc = accuracy_score(vy, (vp >= t_star).astype(int))
-                print(f"{name} ep{ep+1}/{spec['epochs']}  tr_loss={tr_loss:.4f}  "
-                    f"val_acc@t*={val_acc:.3f}  val_f1@t*={val_f1:.3f}  t*={t_star:.2f}")
-
-    # ----- final eval (swap to EMA for eval) -----
-    with torch.no_grad():
-        raw_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        model.load_state_dict(ema_state, strict=False)
-    with ema.average_parameters(model):
-        # choose best val state if it beat EMA snapshot
-        v_logits, vy = eval_logits(model, dl_va, device=DEVICE)
-        vp = eval_prob_fn(v_logits)
-        vp_smooth = _medfilt(vp, k=5)
-        t_star, val_f1 = tune_threshold(vy, vp_smooth, THRESH_GRID)
-        if best[0] >= val_f1 and best[2] is not None:
-            model.load_state_dict(best[2])
-            t_star = best[1]
-            val_f1 = best[0]
-
-    # test
-    with ema.average_parameters(model):
-        te_logits, ty = eval_logits(model, dl_te, device=DEVICE)
-        tp_raw = eval_prob_fn(te_logits)
-
-        # same smoothing used in tune_threshold (e.g., k=5)
-        tp = _median_smooth_1d(tp_raw, k=5)
-        yhat = (tp >= t_star).astype(int)
-
-        groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
-        metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
-        print(f"[TEST] F1@t*={metrics['macro_f1']:.3f} (CI {metrics['macro_f1_ci']}) | "f"BalAcc={metrics['balanced_acc']:.3f} | AUC(raw)={metrics['auc_raw']}")
-        cm = confusion_matrix(ty, yhat).tolist()
-
-    # size & latency
-    packed = packed_bytes_model_paper(model)
-    inf_ms, boot_ms = proxy_latency_estimate(model, T=DATASET_SPECS[ds_key]['T'])
-
-    payload = {
-        'exp': spec,
-        'threshold': float(t_star),
-        'val': {'macro_f1_at_t': float(val_f1)},
-        'test': {**metrics, 'cm': cm},
-        'packed_bytes': int(packed),
-        'latency_ms': {'per_inference': inf_ms, 'boot_or_synth': boot_ms},
-        'device': str(DEVICE), 'meta': meta,
-         'test_acc_at_t': metrics['acc'],
-        'test_f1_at_t':  metrics['macro_f1'],
-    }
-    save_json(name, payload)
-    print_and_log(name, payload)
-    print(f" Success: {name}")
-
-
 
 
 def get_loaders(ds_key, batch=64, verbose=True, force_reload=False):
