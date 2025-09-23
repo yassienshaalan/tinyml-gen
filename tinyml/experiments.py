@@ -3734,9 +3734,9 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
 
         # epoch-level EMA update (kept for TEST)
         ema.update()
-
+        use_ema_now = (ep >= 2)
         # VAL at t* using **current** weights (not EMA) and **smoothed** probs
-        valm = _val_at_tstar(model, dl_va, device, ema, k=5, grid=None, use_ema=True, debug=(ep < 2))
+        valm = _val_at_tstar(model, dl_va, device, ema, k=5, grid=None, use_ema=use_ema_now, debug=(ep < 2))
         if valm['f1'] > best['f1']:
             best.update(
                 f1=valm['f1'], t_star=valm['t_star'],
@@ -6224,95 +6224,58 @@ def train_epoch_ce(model, loader, opt, device=None, clip=1.0,
     return float(tot / max(1, n))
 
 @torch.no_grad()
-
-def eval_logits(model, loader, device=None):
+def eval_logits(model, loader, device):
     """
-    Evaluate model and return logits and true labels.
-    Used in run_one for validation and test evaluation.
+    Returns: (logits_np, y_np)
+    logits shape: [N, C] for multi-class, or [N, 1]/[N] for binary 1-logit models.
     """
-    '''
-    if device is None:
-        device = DEVICE
-
+    was_training = model.training
     model.eval()
-    all_logits = []
-    all_labels = []
-
+    xs, ys = [], []
     with torch.no_grad():
         for xb, yb in loader:
-            try:
-                xb = xb.to(device)
-                yb = yb.to(device)
+            xb = xb.to(device, non_blocking=True)
+            logits = model(xb)                   # [B, C] or [B]
+            xs.append(logits.detach().cpu())
+            ys.append(yb.detach().cpu())
+    logits_t = torch.cat(xs, dim=0)
+    y_t      = torch.cat(ys, dim=0)
+    if was_training:
+        model.train()
+    # convert to numpy
+    return logits_t.numpy(), y_t.numpy()
 
-                logits = model(xb)
-
-                # Check for NaN/infinite logits
-                if torch.isnan(logits).any() or torch.isinf(logits).any():
-                    print(f"WARNING: NaN/Inf logits detected in evaluation, skipping batch...")
-                    continue
-
-                all_logits.append(logits.cpu().numpy())
-                all_labels.append(yb.cpu().numpy())
-
-            except Exception as e:
-                print(f"Error in evaluation batch: {e}")
-                continue
-
-    if not all_logits:
-        print("WARNING: No valid evaluation batches processed!")
-        return np.array([]), np.array([])
-
-
-    return np.concatenate(all_logits), np.concatenate(all_labels)
-    '''
-    device = device or DEVICE
-    model.eval(); outs=[]; ys=[]
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb = xb.to(device)
-            outs.append(model(xb).detach().float().cpu()); ys.append(yb.detach().cpu())
-    return torch.cat(outs).numpy(), torch.cat(ys).numpy()
-
-
-def evaluate_logits(model, dl, device="cpu"):
-    import torch
-    model.eval()
-    all_logits, all_y = [], []
-    with torch.no_grad():
-        for xb, yb in dl:
-            xb = xb.to(device); yb = yb.to(device)
-            lg = model(xb)
-            all_logits.append(lg.detach().cpu())
-            all_y.append(yb.detach().cpu())
-    return torch.concat(all_logits).numpy(), torch.concat(all_y).numpy()
-
-
-def eval_prob_fn(logits_np):
+def eval_prob_fn(logits):
     """
-    Convert logits to probabilities for binary classification.
-    Used in run_one for threshold tuning.
+    Convert logits to P(positive). Handles:
+    - binary with one logit (sigmoid)
+    - binary with two logits (softmax and take class-1)
+    - multiclass (returns max softmax prob, but thresholding only makes sense for binary)
     """
-    if logits_np.ndim == 2 and logits_np.shape[1] == 2:
-        t = torch.from_numpy(logits_np)
-        return torch.softmax(t, dim=1)[:,1].cpu().numpy()
-    t = torch.from_numpy(logits_np).squeeze(-1)
-    return torch.sigmoid(t).cpu().numpy()
-    '''
-    if len(logits) == 0:
-        return np.array([])
+    import numpy as np
 
-    # For binary classification, take softmax and get positive class probability
-    if logits.shape[1] == 2:
-        # Binary classification: return probability of positive class (class 1)
-        probs = torch.softmax(torch.from_numpy(logits), dim=1)
-        return probs[:, 1].numpy()  # Return probability of class 1
-    else:
-        # Multi-class: return max probability
-        probs = torch.softmax(torch.from_numpy(logits), dim=1)
-        return probs.max(dim=1)[0].numpy()
-   '''
+    z = logits
+    if isinstance(z, torch.Tensor):
+        z = z.detach().cpu().numpy()
 
+    z = np.asarray(z)
+    # Binary with 1 logit: shape [N] or [N,1]
+    if z.ndim == 1 or (z.ndim == 2 and z.shape[1] == 1):
+        z1 = z if z.ndim == 1 else z[:, 0]
+        return 1.0 / (1.0 + np.exp(-z1))
 
+    # Binary with 2 logits: softmax over classes (axis=1), take class-1 prob
+    if z.ndim == 2 and z.shape[1] == 2:
+        z = z - z.max(axis=1, keepdims=True)         # stable softmax
+        e = np.exp(z)
+        p = e / e.sum(axis=1, keepdims=True)         # axis=1 is critical
+        return p[:, 1]
+
+    # Multiclass: softmax then max prob (thresholding not meaningful here)
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    p = e / e.sum(axis=1, keepdims=True)
+    return p.max(axis=1)
 
 def _median_smooth_1d(p, k: int | None = None):
     """Small, fast median smoother for 1D numpy arrays (no SciPy needed)."""
