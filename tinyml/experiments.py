@@ -10339,13 +10339,13 @@ def run_one(spec):
     for ep in range(spec['epochs']):
         # QAT: enable halfway through training if model exposes set_qat/clear_qat
         if hasattr(model, "set_qat"):
-        use_qat = (ep >= int(qat_start_frac * spec['epochs']))
-        if use_qat and (not model._qat_state['enabled'] or model._qat_state['bits'] != qat_bits):
-            print(f"[QAT] toggling ON @ epoch {ep+1}/{spec['epochs']} (bits={qat_bits})")
-            model.set_qat(qat_bits)
-        if (not use_qat) and model._qat_state['enabled']:
-            print(f"[QAT] toggling OFF @ epoch {ep+1}/{spec['epochs']}")
-            model.clear_qat()
+            use_qat = (ep >= int(qat_start_frac * spec['epochs']))
+            if use_qat and (not model._qat_state['enabled'] or model._qat_state['bits'] != qat_bits):
+                print(f"[QAT] toggling ON @ epoch {ep+1}/{spec['epochs']} (bits={qat_bits})")
+                model.set_qat(qat_bits)
+            if (not use_qat) and model._qat_state['enabled']:
+                print(f"[QAT] toggling OFF @ epoch {ep+1}/{spec['epochs']}")
+                model.clear_qat()
 
         # KD or plain CE epoch
         if teacher is not None:
