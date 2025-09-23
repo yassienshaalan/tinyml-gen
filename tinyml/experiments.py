@@ -29,6 +29,10 @@ import pandas as pd
 from typing import List, Tuple
 import pandas as pd
 import contextlib
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score,
+    precision_score, recall_score, confusion_matrix
+)
 
 DATASET_REGISTRY = {}
 # Toggle: use class-balanced sampling in the TRAIN loader
@@ -47,6 +51,58 @@ def line(): print("-"*80)
 import datetime, os
 RUN_STAMP = os.environ.get("RUN_STAMP", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
 
+def _bootstrap_ci_stat(fn, y_true, y_pred, p_raw=None, groups=None,
+                       n_boot=1000, alpha=0.05, seed=42):
+    """
+    CI for a metric function 'fn' via bootstrap.
+    - If groups is provided (e.g., record ids), we resample groups (cluster bootstrap).
+    - Else, we do stratified bootstrap by class label to preserve imbalance.
+    - For AUC, pass p_raw and have fn read it from closure or via kwargs.
+    """
+    rng = np.random.default_rng(seed)
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    if p_raw is not None:
+        p_raw = np.asarray(p_raw)
+
+    stats = []
+    if groups is not None:
+        groups = np.asarray(groups)
+        uniq = np.unique(groups)
+        # Pre-index samples by group for speed
+        idx_by_g = {g: np.flatnonzero(groups == g) for g in uniq}
+        for _ in range(n_boot):
+            # sample groups with replacement
+            g_samp = rng.choice(uniq, size=len(uniq), replace=True)
+            idx = np.concatenate([idx_by_g[g] for g in g_samp])
+            yt = y_true[idx]
+            yp = y_pred[idx]
+            pr = (p_raw[idx] if p_raw is not None else None)
+            stats.append(fn(yt, yp, pr))
+    else:
+        # stratified by class
+        pos = np.flatnonzero(y_true == 1)
+        neg = np.flatnonzero(y_true == 0)
+        for _ in range(n_boot):
+            pos_idx = rng.choice(pos, size=len(pos), replace=True)
+            neg_idx = rng.choice(neg, size=len(neg), replace=True)
+            idx = np.concatenate([pos_idx, neg_idx])
+            yt = y_true[idx]
+            yp = y_pred[idx]
+            pr = (p_raw[idx] if p_raw is not None else None)
+            stats.append(fn(yt, yp, pr))
+
+    stats = np.array(stats, dtype=float)
+    lo = np.quantile(stats, alpha/2)
+    hi = np.quantile(stats, 1 - alpha/2)
+    return (float(lo), float(hi))
+
+def _sens_spec(y_true, y_pred):
+    # ensure consistent label order
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0,1]).ravel()
+    sens = tp / (tp + fn + 1e-9)   # recall positive
+    spec = tn / (tn + fp + 1e-9)   # recall negative
+    return float(sens), float(spec)
 
 def _fake_quant_tensor(x, bits=8, eps=1e-8, symmetric=True):
     if bits >= 32:  # effectively off
@@ -1067,8 +1123,6 @@ def eval_classifier_plus(model, loader, device, return_probs=False,
     If threshold is provided, we threshold (optionally on smoothed probs).
     AUC is always computed on RAW probs.
     """
-    from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score
-
     logits, y = eval_logits(model, loader, device)
     p1 = eval_prob_fn(logits)          # RAW probabilities for AUC
 
@@ -1787,8 +1841,6 @@ def _safe_make_apnea_loaders(root: str, cfg: ExpCfg):
 # Advanced metrics
 def compute_metrics(y_true, y_pred):
     """Compute additional metrics beyond accuracy"""
-    from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, confusion_matrix
-
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted')
 
     # For binary classification, compute AUC
@@ -3287,7 +3339,7 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
     # EMA for eval/export stability
     ema_decay = float(model_kwargs.get("ema_decay", 0.999))
     ema = ExponentialMovingAverage(model.parameters(), decay=ema_decay)
-
+    print(f"[EMA] decay={ema_decay}")
     model.to(device)
     params = count_params(model)
     flash_info = estimate_flash_usage(model, 'int8')
@@ -5535,9 +5587,10 @@ def run_one(spec):
         tp = _median_smooth_1d(tp_raw, k=5)
         yhat = (tp >= t_star).astype(int)
 
-        metrics = ec57_metrics_with_ci(ty, yhat)
+        groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
+        metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
         cm = confusion_matrix(ty, yhat).tolist()
-
+        print(f"[TEST] F1@t*={metrics['macro_f1']:.3f} (CI {metrics['macro_f1_ci']}) | "f"BalAcc={metrics['balanced_acc']:.3f} | AUC(raw)={metrics['auc_raw']}")
     # size & latency
     packed = packed_bytes_model_paper(model)
     inf_ms, boot_ms = proxy_latency_estimate(model, T=DATASET_SPECS[ds_key]['T'])
@@ -5549,7 +5602,9 @@ def run_one(spec):
         'test': {**metrics, 'cm': cm},
         'packed_bytes': int(packed),
         'latency_ms': {'per_inference': inf_ms, 'boot_or_synth': boot_ms},
-        'device': str(DEVICE), 'meta': meta
+        'device': str(DEVICE), 'meta': meta,
+         'test_acc_at_t': metrics['acc'],
+        'test_f1_at_t':  metrics['macro_f1'],
     }
     save_json(name, payload)
     print_and_log(name, payload)
@@ -6104,13 +6159,64 @@ def _bootstrap_ci(metric_fn, y_true, y_pred, n_boot=200, alpha=0.05, rng=None):
     lo = vals[int((alpha/2)*n)]; hi = vals[int((1-alpha/2)*n)]
     return float(lo), float(hi)
 
-def ec57_metrics_with_ci(y_true, y_pred):
-    acc = accuracy_score(y_true, y_pred)
-    f1  = f1_score(y_true, y_pred, average='macro', zero_division=0)
-    acc_ci = _bootstrap_ci(lambda a,b: accuracy_score(a,b), y_true, y_pred)
-    f1_ci  = _bootstrap_ci(lambda a,b: f1_score(a,b, average='macro', zero_division=0), y_true, y_pred)
-    return {"acc": float(acc), "acc_ci": acc_ci, "macro_f1": float(f1), "macro_f1_ci": f1_ci}
-# Size helpers
+def ec57_metrics_with_ci(y_true, y_pred, p_raw=None, groups=None,
+                         n_boot=1000, alpha=0.05):
+    """
+    Extended metrics:
+      - acc, balanced_acc, macro_f1 (thresholded)
+      - precision_macro, recall_macro
+      - sensitivity (pos recall), specificity (neg recall)
+      - auc_raw (on raw probs), if p_raw is provided and both classes present
+    CIs via cluster bootstrap (groups) or stratified bootstrap (fallback).
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    acc   = accuracy_score(y_true, y_pred)
+    bal   = balanced_accuracy_score(y_true, y_pred)
+    f1m   = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    precm = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recm  = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    sens, spec = _sens_spec(y_true, y_pred)
+
+    auc_val = None
+    if p_raw is not None and len(np.unique(y_true)) > 1:
+        try:
+            auc_val = roc_auc_score(y_true, p_raw)
+        except Exception:
+            auc_val = None
+
+    # CI helpers that close over inputs
+    def _acc_fn(yt, yp, _pr):  return accuracy_score(yt, yp)
+    def _bal_fn(yt, yp, _pr):  return balanced_accuracy_score(yt, yp)
+    def _f1m_fn(yt, yp, _pr):  return f1_score(yt, yp, average='macro', zero_division=0)
+    def _auc_fn(yt, _yp, pr):  # needs raw probs
+        if pr is None or len(np.unique(yt)) < 2: return np.nan
+        try: return roc_auc_score(yt, pr)
+        except Exception: return np.nan
+
+    acc_ci = _bootstrap_ci_stat(_acc_fn, y_true, y_pred, p_raw=None, groups=groups,
+                                n_boot=n_boot, alpha=alpha)
+    bal_ci = _bootstrap_ci_stat(_bal_fn, y_true, y_pred, p_raw=None, groups=groups,
+                                n_boot=n_boot, alpha=alpha)
+    f1m_ci = _bootstrap_ci_stat(_f1m_fn, y_true, y_pred, p_raw=None, groups=groups,
+                                n_boot=n_boot, alpha=alpha)
+    auc_ci = None
+    if auc_val is not None:
+        auc_ci = _bootstrap_ci_stat(_auc_fn, y_true, y_pred, p_raw=p_raw, groups=groups,
+                                    n_boot=n_boot, alpha=alpha)
+
+    return {
+        "acc": float(acc), "acc_ci": acc_ci,
+        "balanced_acc": float(bal), "balanced_acc_ci": bal_ci,
+        "macro_f1": float(f1m), "macro_f1_ci": f1m_ci,
+        "precision_macro": float(precm),
+        "recall_macro": float(recm),
+        "sensitivity": sens,
+        "specificity": spec,
+        "auc_raw": (float(auc_val) if auc_val is not None else None),
+        "auc_raw_ci": auc_ci,
+    }
 
 def _count_params(m):
     if 'count_parameters' in globals():
@@ -10343,7 +10449,7 @@ def run_one(spec):
             if use_qat and (not model._qat_state['enabled'] or model._qat_state['bits'] != qat_bits):
                 print(f"[QAT] toggling ON @ epoch {ep+1}/{spec['epochs']} (bits={qat_bits})")
                 model.set_qat(qat_bits)
-            if (not use_qat) and model._qat_state['enabled']:
+            elif (not use_qat) and model._qat_state['enabled']:
                 print(f"[QAT] toggling OFF @ epoch {ep+1}/{spec['epochs']}")
                 model.clear_qat()
 
@@ -10417,7 +10523,9 @@ def run_one(spec):
         tp = _median_smooth_1d(tp_raw, k=5)
         yhat = (tp >= t_star).astype(int)
 
-        metrics = ec57_metrics_with_ci(ty, yhat)
+        groups = getattr(getattr(dl_te, 'dataset', None), 'record_ids', None)
+        metrics = ec57_metrics_with_ci(ty, yhat, p_raw=tp_raw, groups=groups)
+        print(f"[TEST] F1@t*={metrics['macro_f1']:.3f} (CI {metrics['macro_f1_ci']}) | "f"BalAcc={metrics['balanced_acc']:.3f} | AUC(raw)={metrics['auc_raw']}")
         cm = confusion_matrix(ty, yhat).tolist()
 
     # size & latency
@@ -10431,7 +10539,9 @@ def run_one(spec):
         'test': {**metrics, 'cm': cm},
         'packed_bytes': int(packed),
         'latency_ms': {'per_inference': inf_ms, 'boot_or_synth': boot_ms},
-        'device': str(DEVICE), 'meta': meta
+        'device': str(DEVICE), 'meta': meta,
+         'test_acc_at_t': metrics['acc'],
+        'test_f1_at_t':  metrics['macro_f1'],
     }
     save_json(name, payload)
     print_and_log(name, payload)
