@@ -3803,6 +3803,7 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
     metrics, cm = (metrics_ema, cm_ema) if use_ema else (metrics_raw, cm_raw)
     t_star      = float(t_star_ema if use_ema else t_star_raw)
     chosen      = "EMA" if use_ema else "RAW"
+    test_pos_rate = float(pos_rate_ema if use_ema else pos_rate_raw)
 
     print(
         f" New Test acc@t*={metrics['acc']:.4f} "
@@ -3863,6 +3864,16 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         'channels': meta.get('num_channels', None),
         'seq_len': meta.get('seq_len', None),
         'num_classes': meta.get('num_classes', None),
+        'test_branch': 'EMA' if use_ema else 'RAW',
+        't_star_raw': float(t_star_raw),
+        't_star_ema': float(t_star_ema),
+        'test_pos_rate': float(test_pos_rate),
+
+        # (Optional but handy for audits)
+        'raw_test_acc': float(metrics_raw['acc']),
+        'raw_test_f1_at_t': float(metrics_raw['macro_f1']),
+        'ema_test_acc': float(metrics_ema['acc']),
+        'ema_test_f1_at_t': float(metrics_ema['macro_f1']),
     }
 
 def _val_at_tstar(model, loader, device, ema, k=5, grid=None, use_ema=False, debug=False):
