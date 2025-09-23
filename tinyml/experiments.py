@@ -3734,9 +3734,7 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
 
         # epoch-level EMA update (kept for TEST)
         ema.update()
-        use_ema_now = (ep + 1) >= max(2, int(0.25 * cfg.epochs))  # no-EMA for first ~25% epochs
-        # VAL at t* using **current** weights (not EMA) and **smoothed** probs
-        valm = _val_at_tstar(model, dl_va, device, ema, k=5, grid=THRESH_GRID,use_ema=use_ema_now, debug=(ep < 2))
+        valm = _val_at_tstar(model, dl_va, device, ema=None, k=5, grid=THRESH_GRID,use_ema=False, debug=(ep < 2)
         if valm['f1'] > best['f1']:
             best.update(
                 f1=valm['f1'], t_star=valm['t_star'],
