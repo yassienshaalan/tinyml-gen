@@ -3736,7 +3736,7 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         ema.update()
 
         # VAL at t* using **current** weights (not EMA) and **smoothed** probs
-        valm = _val_at_tstar(model, dl_va, device, ema, grid=THRESH_GRID, k=5, use_ema=True, groups=va_groups)
+        valm = _val_at_tstar(model, dl_va, device, ema, k=5, grid=None, use_ema=True, debug=(ep < 2))
         if valm['f1'] > best['f1']:
             best.update(
                 f1=valm['f1'], t_star=valm['t_star'],
@@ -3746,11 +3746,11 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
             )
 
         print(f'  Epoch {ep+1}/{cfg.epochs}: '
-            f'train_loss={tr_loss:.4f} '
-            f'val_acc@t*={valm["acc"]:.4f} '
-            f'val_F1@t*={valm["f1"]:.4f} '
-            f't*={valm["t_star"]:.3f} '
-            f'P/R(macro)={valm["prec"]:.3f}/{valm["rec"]:.3f}')
+      f'train_loss={tr_loss:.4f} '
+      f'val_acc@t*={valm["acc"]:.4f} '
+      f'val_F1@t*={valm["f1"]:.4f} '
+      f't*={valm["t_star"]:.3f} '
+      f'P/R(macro)={valm["prec"]:.3f}/{valm["rec"]:.3f}')
 
 
     # restore best checkpoint + carry forward best VAL metrics
@@ -3825,31 +3825,50 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
         'num_classes': meta.get('num_classes', None),
     }
 
-def _val_at_tstar(model, loader, device, ema=None, grid=None, k=5, use_ema=False, groups=None):
-    """
-    Compute t* on VAL via F1 over a threshold grid using median-smoothed probs.
-    Metrics are computed from the SAME smoothed decisions at t*.
-    """
-    import numpy as np
+def _val_at_tstar(model, loader, device, ema, k=5, grid=None, use_ema=True, debug=False):
+    import contextlib, numpy as np
+    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+    # Ensure we have a proper grid
     if grid is None:
-        grid = np.linspace(0.05, 0.95, 181)
-
-    if use_ema and (ema is not None):
-        with ema.average_parameters(model):
-            v_logits, vy = eval_logits(model, loader, device=device)
+        grid = np.linspace(0.05, 0.95, 181)  # 0.05..0.95 step 0.005
     else:
+        grid = np.asarray(grid, dtype=float)
+
+    # Eval with EMA or current weights
+    ctx = ema.average_parameters(model) if use_ema else contextlib.nullcontext()
+    with ctx:
         v_logits, vy = eval_logits(model, loader, device=device)
+    vp = eval_prob_fn(v_logits)
 
-    vp = eval_prob_fn(v_logits)              # must be P(class=1) as a 1D array
-    vp_s = _median_smooth_grouped(vp, groups=groups, k=k)
+    if debug:
+        print(f"[VAL DEBUG] grid_len={len(grid)}  grid_min/max={grid[0]:.3f}/{grid[-1]:.3f}")
+        print(f"[VAL DEBUG] p_raw min/mean/max: {vp.min():.3f}/{vp.mean():.3f}/{vp.max():.3f}")
 
-    t_star, f1 = tune_threshold(vy, vp_s, grid)
+    vp_s = _median_smooth_1d(vp, k=k) if (k and k > 1) else vp
+    if debug:
+        print(f"[VAL DEBUG] p_smooth min/mean/max: {vp_s.min():.3f}/{vp_s.mean():.3f}/{vp_s.max():.3f}")
+
+    # Sweep thresholds for macro-F1 on smoothed probs
+    f1s = []
+    for t in grid:
+        yhat = (vp_s >= t).astype(int)
+        f1s.append(f1_score(vy, yhat, average=_choose_avg(vy), zero_division=0))
+    f1s = np.asarray(f1s)
+    idx = int(np.nanargmax(f1s))
+    t_star = float(grid[idx])
+    best_f1 = float(f1s[idx])
+
+    # Metrics at t*
     yhat = (vp_s >= t_star).astype(int)
-
     acc  = float(accuracy_score(vy, yhat))
-    prec = float(precision_score(vy, yhat, average='macro', zero_division=0))
-    rec  = float(recall_score(vy, yhat, average='macro', zero_division=0))
-    return {'t_star': float(t_star), 'f1': float(f1), 'acc': acc, 'prec': prec, 'rec': rec}
+    prec = float(precision_score(vy, yhat, average=_choose_avg(vy), zero_division=0))
+    rec  = float(recall_score(vy, yhat, average=_choose_avg(vy), zero_division=0))
+
+    if debug:
+        print(f"[VAL DEBUG] t*={t_star:.3f} | F1={best_f1:.3f} | acc={acc:.3f} | pos_rate={yhat.mean():.3f}")
+
+    return dict(f1=best_f1, t_star=t_star, acc=acc, prec=prec, rec=rec)
 
 def _test_at_tstar(model, loader, device, ema, t_star, k=5, groups=None):
     """
