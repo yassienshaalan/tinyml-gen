@@ -104,7 +104,7 @@ def main():
 
     cfg = ExpCfg(epochs=8, batch_size=64, lr=2e-3,
                  device=('cuda' if os.environ.get('CUDA_VISIBLE_DEVICES') else 'cpu'),
-                 limit=None, num_workers=0, target_fs=None,
+                 limit=None, num_workers=max(2, getattr(cfg, "num_workers", 0)), target_fs=None,eval_every = 2,
                  length=1800, window_ms=800, input_len=1800)
     seed_everything(getattr(cfg, "seed", 42))
     print("[Available]", available_datasets()); print("[Run]", datasets)
