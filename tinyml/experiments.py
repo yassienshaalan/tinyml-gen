@@ -3797,7 +3797,7 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
                 f'P/R(macro)={valm["prec"]:.3f}/{valm["rec"]:.3f}')
         else:
             # lightweight heartbeat
-        print(f'  Epoch {ep+1}/{cfg.epochs}: train_loss={tr_loss:.4f} [val skipped]')
+            print(f'  Epoch {ep+1}/{cfg.epochs}: train_loss={tr_loss:.4f} [val skipped]')
 
 
     # --- restore best checkpoint + carry forward best VAL metrics ---
