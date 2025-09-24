@@ -51,6 +51,7 @@ def line(): print("-"*80)
 import datetime, os
 RUN_STAMP = os.environ.get("RUN_STAMP", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
 
+
 def _bootstrap_ci_stat(fn, y_true, y_pred, p_raw=None, groups=None,
                        n_boot=1000, alpha=0.05, seed=42):
     """
@@ -3482,6 +3483,34 @@ def run_experiment(cfg: ExpCfg, dataset_name: str, model_name: str):
     }
     return results
 
+_DIAG_DONE = set()                 # datasets we've already run diagnostics for
+_TEACHER_STATE_CACHE = {}          # (ds, in_ch, ncls, lr) -> state_dict (CPU)
+
+def build_or_clone_cached_teacher(ds_key, in_ch, ncls, cfg, dl_tr, meta):
+    """
+    Warm a 'regular_cnn' teacher once per dataset signature, cache its state_dict on CPU,
+    and for subsequent runs clone a fresh model and load the cached weights.
+    """
+    key = (ds_key, int(in_ch), int(ncls), float(getattr(cfg, "lr", 1e-3)))
+    device = torch.device(cfg.device)
+
+    if key not in _TEACHER_STATE_CACHE:
+        print(" [KD] Warming teacher once and caching state...")
+        t = safe_build_model("regular_cnn", in_ch, ncls).to(device)
+        t_opt = torch.optim.AdamW(t.parameters(), lr=getattr(cfg, "lr", 1e-3))
+        # small warmup (fast but effective); keep it short
+        t_epochs = max(2, int(getattr(cfg, "epochs", 8) // 2))
+        for _ in range(t_epochs):
+            # CE only; no extras
+            _ = train_epoch_ce(t, dl_tr, t_opt, device=device, meta=meta,
+                               w_size=0.0, w_spec=0.0, w_softf1=0.0)
+        _TEACHER_STATE_CACHE[key] = {k: v.detach().cpu().clone() for k, v in t.state_dict().items()}
+
+    # clone fresh teacher and load cached weights (safe for multiple downstream runs)
+    t2 = safe_build_model("regular_cnn", in_ch, ncls).to(device)
+    t2.load_state_dict(_TEACHER_STATE_CACHE[key], strict=False)
+    return t2
+
 def run_all_experiments(cfg: ExpCfg, datasets: List[str] = None):
     """
     Multi-dataset orchestrator (max test accuracy focus).
@@ -3511,7 +3540,13 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str] = None):
 
     # Timestamped run subdir
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_subdir = f"run-{ts}"
+    run_tag = getattr(cfg, "run_tag", None) or os.environ.get("RUN_TAG")  
+    uniq = f"{ts}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
+    # label datasets in folder name (safe if 1 dataset per session; still helpful if multiple)
+    dslabel = "-".join(datasets)
+    run_subdir = f"run-{uniq}-{dslabel}{('-' + run_tag) if run_tag else ''}"
+
 
     # Build planned grids
     plan = {ds: build_model_grid_for_dataset(ds) for ds in datasets}
@@ -3538,7 +3573,7 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str] = None):
             print_class_dist_from_loaders(dl_tr, dl_va, dl_te, meta)
         except Exception:
             pass
-
+        did_diag = False
         for spec in grid:
             exp_counter += 1
             name   = spec['name']
@@ -3550,12 +3585,15 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str] = None):
             try:
                 # Reuse loaders for speed/consistency
                 res = run_experiment_unified(
-                    cfg, ds, name,
-                    model_kwargs=kwargs,
-                    kd=kd,
-                    loaders=(dl_tr, dl_va, dl_te, meta),
-                    w_size=1.0, w_bit=(0.05 if kd else 0.0), w_spec=1e-4, w_softf1=0.10
+                cfg, ds, name,
+                model_kwargs=kwargs,
+                kd=kd,
+                loaders=(dl_tr, dl_va, dl_te, meta),
+                w_size=1.0, w_bit=(0.05 if kd else 0.0), w_spec=1e-4, w_softf1=0.10,
+                do_diagnostics=(not did_diag),   # ← only first model per dataset
+                eval_every=getattr(cfg, "eval_every", 2)  # ← validate every 2 epochs
                 )
+                did_diag = True
                 if res:
                     res['exp_id']   = exp_id
                     res['exp_name'] = f"{ds}+{name}"
@@ -3621,7 +3659,7 @@ def run_all_experiments(cfg: ExpCfg, datasets: List[str] = None):
 
 def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=False,
                            w_size=1.0, w_bit=0.05, w_spec=1e-4, w_softf1=0.10,
-                           loaders=None):
+                           loaders=None, do_diagnostics=False, eval_every=2):
     """
     Unified training + threshold-tuned evaluation (EMA + median smoothing).
     No legacy 'Test accuracy:' print. Checkpoints by best VAL macro-F1@t*.
@@ -3697,12 +3735,18 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
 
     # --- diagnostics (short) ---
-    try:
-        sample_x = next(iter(dl_tr))[0][:1].to(device)
-        diagnose_nan_issues(model, sample_x, device)
-        fix_nan_issues(model)
-    except Exception:
-        pass
+    # --- diagnostics (run once per dataset to save time) ---
+    if do_diagnostics and (dataset_name not in _DIAG_DONE):
+        try:
+            sample_x = next(iter(dl_tr))[0][:1].to(device)
+            diagnose_nan_issues(model, sample_x, device)
+            fix_nan_issues(model)
+            _DIAG_DONE.add(dataset_name)
+        except Exception:
+            pass
+    else:
+        print("[DIAG] Skipped (already done for this dataset).")
+
 
     # decide threshold grid safely (avoid 'array or default' bug)
     try:
@@ -3734,21 +3778,26 @@ def run_experiment_unified(cfg, dataset_name, model_name, model_kwargs=None, kd=
 
         # epoch-level EMA update (kept for TEST)
         ema.update()
-        valm = _val_at_tstar(model, dl_va, device, ema, k=5, grid=THRESH_GRID, use_ema=False, debug=False)
-        if valm['f1'] > best['f1']:
-            best.update(
-            f1=valm['f1'], t_star=valm['t_star'],
-            acc=valm['acc'], prec=valm['prec'], rec=valm['rec'],
-            state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-            epoch=ep+1
-        )
-
-        print(f'  Epoch {ep+1}/{cfg.epochs}: '
-      f'train_loss={tr_loss:.4f} '
-      f'val_acc@t*={valm["acc"]:.4f} '
-      f'val_F1@t*={valm["f1"]:.4f} '
-      f't*={valm["t_star"]:.3f} '
-      f'P/R(macro)={valm["prec"]:.3f}/{valm["rec"]:.3f}')
+        do_val = ((ep + 1) % int(eval_every) == 0) or ((ep + 1) == cfg.epochs)
+        if do_val:
+            with torch.inference_mode():
+                valm = _val_at_tstar(model, dl_va, device, ema, k=5, grid=THRESH_GRID)
+            if valm['f1'] > best['f1']:
+                best.update(
+                    f1=valm['f1'], t_star=valm['t_star'],
+                    acc=valm['acc'], prec=valm['prec'], rec=valm['rec'],
+                    state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                    epoch=ep + 1
+                )
+            print(f'  Epoch {ep+1}/{cfg.epochs}: '
+                f'train_loss={tr_loss:.4f} '
+                f'val_acc@t*={valm["acc"]:.4f} '
+                f'val_F1@t*={valm["f1"]:.4f} '
+                f't*={valm["t_star"]:.3f} '
+                f'P/R(macro)={valm["prec"]:.3f}/{valm["rec"]:.3f}')
+        else:
+            # lightweight heartbeat
+        print(f'  Epoch {ep+1}/{cfg.epochs}: train_loss={tr_loss:.4f} [val skipped]')
 
 
     # --- restore best checkpoint + carry forward best VAL metrics ---
@@ -3990,13 +4039,19 @@ def run_one(spec):
     teacher = None
     if spec.get('kd', False):
         print(" Setting up teacher (RegularCNN1D) for KD...")
+
         try:
-            in_ch = meta.get('num_channels', 1)
-            num_classes = meta.get('num_classes', 2)
-            teacher = safe_build_model("regular_cnn", in_ch, num_classes).to(DEVICE)
+            teacher = build_or_clone_cached_teacher(dataset_name, in_ch, ncls, cfg, dl_tr, meta)
+            print(" Teacher ready (from cache).")
         except Exception as e:
-            print(f"  Teacher build failed: {e} (continuing without KD)")
-            teacher = None
+            print(f" Teacher build failed: {e} (continuing without KD)")    
+            try:
+                in_ch = meta.get('num_channels', 1)
+                num_classes = meta.get('num_classes', 2)
+                teacher = safe_build_model("regular_cnn", in_ch, num_classes).to(DEVICE)
+            except Exception as e:
+                print(f"  Teacher build failed: {e} (continuing without KD)")
+                teacher = None
 
         if teacher is not None:
             t_opt = torch.optim.AdamW(teacher.parameters(), lr=spec['lr'])
