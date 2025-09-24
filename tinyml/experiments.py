@@ -6839,6 +6839,8 @@ class ExpCfg:
     num_workers: int = 2
     limit: Optional[int] = None
 
+    eval_every: int = 2
+
     # --- Windowing / signal ---
     window_ms: int = 60000
     target_fs: int = 100
