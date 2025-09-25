@@ -1,10 +1,3 @@
-# models.py (VM-ready)
-# ------------------------------------------------------------
-# - Fixes: NameError for @_register_model, empty MODEL_BUILDERS
-# - Removes duplicate classes, adds helpers used by cores
-# - Registers models + sets aliases so experiment names resolve
-# ------------------------------------------------------------
-
 import math, os, json, random
 from typing import Any, Dict, Callable, Optional
 

@@ -1,5 +1,3 @@
-# main.py — clean entrypoint using GCS-aware loaders + normalized gs:// roots
-
 import os, sys, logging, argparse
 from pathlib import Path
 
@@ -22,7 +20,6 @@ def _open_logfile(base_dir="logs", prefix="run"):
     os.makedirs(base_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     path = os.path.join(base_dir, f"{prefix}-{ts}.log")
-    # line-buffered text mode for timely writes
     f = open(path, "a", buffering=1, encoding="utf-8")
     f.write(f"=== START {ts} ===\n")
     return f, path
