@@ -913,70 +913,6 @@ def stratified_by_minutes_split(root, records, seed=1337, frac=(0.8,0.1,0.1), ta
 
     tra = splits[0]['recs']; val = splits[1]['recs']; tes = splits[2]['recs']
     return tra, val, tes
-'''
-# Loader alias shims
-def load_apnea_ecg_loaders_impl(root, batch_size=64, length=1800, stride=None, verbose=True, seed=1337):
-    """
-    Stratified version of the loader:
-      - filters to a**, b**, c** with .apn
-      - minute-aligned windows with length=stride=1800 by default
-      - stratified split by RECORD to ensure val/test contain apnea-positive records
-      - optional WeightedRandomSampler for the TRAIN loader
-    """
-    root = Path(root)
-    if verbose:
-        print(f"[ApneaECG] root={root} | length={length} | stride={stride}")
-
-    recs = _list_trainable_records(root)
-    if verbose:
-        print(f"[ApneaECG] usable records={len(recs)} → {recs[:10]}{' ...' if len(recs)>10 else ''}")
-    if not recs:
-        raise RuntimeError("No usable records (need a**, b**, c** with .apn/.dat/.hea).")
-
-    # --- stratified split by record ---
-    train_recs, val_recs, test_recs = _stratified_record_split_apnea(root, recs, seed=seed, frac=(0.8,0.1,0.1))
-    #train_recs, val_recs, test_recs = stratified_by_minutes_split(root, recs, seed=seed, frac=(0.8,0.1,0.1))
-    if verbose:
-        tr_stats = _record_apnea_stats(root, train_recs)
-        va_stats = _record_apnea_stats(root, val_recs)
-        te_stats = _record_apnea_stats(root, test_recs)
-        print(f"[Split] train|val|test records: {len(train_recs)}|{len(val_recs)}|{len(test_recs)}")
-        print(f"  positives per split (records w/ any apnea): "
-              f"{sum(1 for _,a,_,_ in tr_stats if a>0)} | "
-              f"{sum(1 for _,a,_,_ in va_stats if a>0)} | "
-              f"{sum(1 for _,a,_,_ in te_stats if a>0)}")
-
-    # --- datasets ---
-    ds_tr = ApneaECGWindows(root, train_recs, length=length, stride=stride, verbose=verbose)
-    ds_va = ApneaECGWindows(root, val_recs,   length=length, stride=stride, verbose=verbose)
-    ds_te = ApneaECGWindows(root, test_recs,  length=length, stride=stride, verbose=verbose)
-
-    # --- loaders (optionally weighted sampler for train) ---
-    num_workers = 2 if torch.cuda.is_available() else 0
-    if USE_WEIGHTED_SAMPLER:
-        sampler = _make_weighted_sampler_apnea(ds_tr)
-        dl_tr = DataLoader(ds_tr, batch_size=batch_size, sampler=sampler, shuffle=False,num_workers=num_workers, drop_last=True, worker_init_fn=_wif)
-    else:
-        dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True,num_workers=num_workers, drop_last=True, worker_init_fn=_wif)
-    dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False, worker_init_fn=_wif)
-    dl_te = DataLoader(ds_te, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False, worker_init_fn=_wif)
-
-    # quick distributions
-    print("\n=== ApneaECG Train class distribution (approx) ===")
-    print_class_distribution(dl_tr, "ApneaECG Train")
-    print("========================================")
-    print("\n=== ApneaECG Val class distribution (approx) ===")
-    print_class_distribution(dl_va, "ApneaECG Val")
-    print("========================================")
-    print("\n=== ApneaECG Test class distribution (approx) ===")
-    print_class_distribution(dl_te, "ApneaECG Test")
-    print("========================================")
-
-    if len(ds_tr) == 0 or len(ds_va) == 0:
-        raise RuntimeError("No windows built. Check .apn presence and that length < 6000.")
-
-    return dl_tr, dl_va, dl_te
-'''
 # ==== PTB-XL preprocessing & loaders ====
 AAMI_MAP = {
     # N: normal and LBBB/RBBB etc.
@@ -4797,7 +4733,7 @@ def check_dataset_paths():
     }
 
     for name, path in paths_to_check.items():
-        print(f"\n📂 {name}:")
+        print(f"\n {name}:")
         print(f"   Path: {path}")
         print(f"   Exists: {path.exists()}")
 
@@ -9015,7 +8951,7 @@ def check_dataset_paths():
     }
 
     for name, path in paths_to_check.items():
-        print(f"\n📂 {name}:")
+        print(f"\n {name}:")
         print(f"   Path: {path}")
         print(f"   Exists: {path.exists()}")
 
