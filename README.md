@@ -1,6 +1,6 @@
-# Generative Compression of Channel Mixing for Separable CNNs on Microcontrollers
+# Once-for-All Channel Mixers (HYPERTINYPW): Generative Compression for TinyML
 
-Code for reproducing results from paper "Generative Compression of Channel Mixing for Separable CNNs on Microcontrollers".
+Code for reproducing results from paper "Once-for-All Channel Mixers (HYPERTINYPW): Generative Compression for TinyML". Accepted at MlSys26 (Conference on Machine Learning and Systems). 
 
 ## Rebuttal Experiments (NEW)
 
