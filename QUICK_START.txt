@@ -1,0 +1,76 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║            REBUTTAL EXPERIMENTS - QUICK REFERENCE                    ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ FASTEST START (Uses EXISTING data only - no downloads!)              │
+└──────────────────────────────────────────────────────────────────────┘
+
+  cd tinyml
+  python run_rebuttal_experiments.py --experiments ternary,synthesis,nas
+
+  * 5-10 minutes total
+  * All results logged to: rebuttal_results/
+  * Uses existing ECG data or synthetic
+
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ WHAT GETS LOGGED                                                     │
+└──────────────────────────────────────────────────────────────────────┘
+
+  rebuttal_results/
+    ├── experiment_full.log         ← Complete run log
+    ├── rebuttal_summary.json       ← All results summary
+    ├── ternary_comparison.json     ← Quantization comparison
+    ├── synthesis_profile.json      ← Boot-time profiling
+    └── nas_compatibility.json      ← NAS compatibility
+
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ WHAT EACH EXPERIMENT DOES                                            │
+└──────────────────────────────────────────────────────────────────────┘
+
+  ternary      → Compare to 2-bit quantization (1 min, no download)
+  synthesis    → Boot-time overhead analysis (2-5 min, no download)
+  nas          → NAS compatibility demo (2 min, no download)
+  keyword_spotting → Speech domain (30-60 min, NEEDS dataset)
+
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ DATA SOURCES                                                         │
+└──────────────────────────────────────────────────────────────────────┘
+
+  * ternary:    Uses EXISTING ECG data or synthetic
+  * synthesis:  Synthetic (no data needed)
+  * nas:        Synthetic (no data needed)
+  * keyword_spotting: Needs Speech Commands (~2GB download)
+
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ OPTIONAL: Download Speech Commands (for keyword spotting)           │
+└──────────────────────────────────────────────────────────────────────┘
+
+  wget http://download.tensorflow.org/data/speech_commands_v0.02.tar.gz
+  tar -xzf speech_commands_v0.02.tar.gz
+  set SPEECH_COMMANDS_ROOT=path\to\speech_commands_v0.02
+
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ DOCUMENTATION                                                        │
+└──────────────────────────────────────────────────────────────────────┘
+
+  Read: REBUTTAL_GUIDE.md (complete guide)
+
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ KEY POINTS                                                           │
+└──────────────────────────────────────────────────────────────────────┘
+
+  - All experiments LOG to files automatically
+  - Most experiments use EXISTING data (no downloads)
+  - Only keyword spotting needs new dataset (optional)
+  - Results ready for paper in JSON format
+
+╔══════════════════════════════════════════════════════════════════════╗
+║ Run: python run_rebuttal_experiments.py --experiments ternary,synthesis,nas
+╚══════════════════════════════════════════════════════════════════════╝
