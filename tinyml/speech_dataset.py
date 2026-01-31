@@ -9,6 +9,13 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 from pathlib import Path
 import torchaudio
+
+# Set backend to avoid torchcodec dependency
+try:
+    torchaudio.set_audio_backend("soundfile")
+except RuntimeError:
+    pass  # Backend might already be set or not available
+
 from typing import Tuple, Dict, Optional
 
 # Standard Google Speech Commands v2 (35 classes)

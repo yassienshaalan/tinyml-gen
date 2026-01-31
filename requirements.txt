@@ -7,3 +7,4 @@ tqdm
 pydrive2
 wfdb>=4.1.0
 scipy
+soundfile>=0.12.0
