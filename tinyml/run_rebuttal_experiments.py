@@ -314,6 +314,55 @@ def run_ternary_baseline_comparison(args):
     hyper_model = hyper_model.to(device)
     ternary_model = ternary_model.to(device)
     
+    # Training function (used for both real and synthetic data)
+    def train_and_evaluate(model, name, train_loader, val_loader, test_loader, num_epochs=10):
+        print(f"\n[{name}]")
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        criterion = torch.nn.CrossEntropyLoss()
+        
+        best_val_acc = 0
+        for epoch in range(num_epochs):
+            model.train()
+            for x, y in train_loader:
+                x, y = x.to(device), y.to(device)
+                optimizer.zero_grad()
+                out = model(x)
+                loss = criterion(out, y)
+                loss.backward()
+                optimizer.step()
+            
+            # Validation
+            model.eval()
+            val_correct = 0
+            val_total = 0
+            with torch.no_grad():
+                for x, y in val_loader:
+                    x, y = x.to(device), y.to(device)
+                    out = model(x)
+                    pred = out.argmax(dim=1)
+                    val_correct += (pred == y).sum().item()
+                    val_total += y.size(0)
+            
+            val_acc = 100. * val_correct / val_total
+            best_val_acc = max(best_val_acc, val_acc)
+            print(f"  Epoch {epoch+1}/{num_epochs}: Val Acc = {val_acc:.2f}%")
+        
+        # Test accuracy
+        model.eval()
+        test_correct = 0
+        test_total = 0
+        with torch.no_grad():
+            for x, y in test_loader:
+                x, y = x.to(device), y.to(device)
+                out = model(x)
+                pred = out.argmax(dim=1)
+                test_correct += (pred == y).sum().item()
+                test_total += y.size(0)
+        
+        test_acc = 100. * test_correct / test_total
+        print(f"  Final Test Accuracy: {test_acc:.2f}%")
+        return test_acc, best_val_acc
+    
     # Try to load a simple dataset for training
     try:        # Try to use real ECG data first
         from data_loaders import APNEA_ROOT
@@ -368,64 +417,14 @@ def run_ternary_baseline_comparison(args):
         print(f"Using synthetic ECG data for evaluation")
         print("Note: Data has clear pattern (mean shift +1.0) - expect 70-95% accuracy")
         
-        # Quick training (10 epochs for more stable convergence)
+        # Train both models on synthetic data
         num_epochs = 10
-        
-        def train_and_evaluate(model, name):
-            print(f"\n[{name}]")
-            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-            criterion = torch.nn.CrossEntropyLoss()
-            
-            best_val_acc = 0
-            for epoch in range(num_epochs):
-                model.train()
-                for x, y in train_loader:
-                    x, y = x.to(device), y.to(device)
-                    optimizer.zero_grad()
-                    out = model(x)
-                    loss = criterion(out, y)
-                    loss.backward()
-                    optimizer.step()
-                
-                # Validation
-                model.eval()
-                val_correct = 0
-                val_total = 0
-                with torch.no_grad():
-                    for x, y in val_loader:
-                        x, y = x.to(device), y.to(device)
-                        out = model(x)
-                        pred = out.argmax(dim=1)
-                        val_correct += (pred == y).sum().item()
-                        val_total += y.size(0)
-                
-                val_acc = 100. * val_correct / val_total
-                best_val_acc = max(best_val_acc, val_acc)
-                print(f"  Epoch {epoch+1}/{num_epochs}: Val Acc = {val_acc:.2f}%")
-            
-            # Test accuracy
-            model.eval()
-            test_correct = 0
-            test_total = 0
-            with torch.no_grad():
-                for x, y in test_loader:
-                    x, y = x.to(device), y.to(device)
-                    out = model(x)
-                    pred = out.argmax(dim=1)
-                    test_correct += (pred == y).sum().item()
-                    test_total += y.size(0)
-            
-            test_acc = 100. * test_correct / test_total
-            print(f"  Final Test Accuracy: {test_acc:.2f}%")
-            return test_acc, best_val_acc
-        
-        # Train both models
-        hyper_test_acc, hyper_val_acc = train_and_evaluate(hyper_model, "HyperTinyPW")
-        ternary_test_acc, ternary_val_acc = train_and_evaluate(ternary_model, "Ternary")
+        hyper_test_acc, hyper_val_acc = train_and_evaluate(hyper_model, "HyperTinyPW", train_loader, val_loader, test_loader, num_epochs)
+        ternary_test_acc, ternary_val_acc = train_and_evaluate(ternary_model, "Ternary", train_loader, val_loader, test_loader, num_epochs)
         
         # Show the trade-off
         print("\n" + "=" * 60)
-        print("ACCURACY vs SIZE TRADE-OFF")
+        print("ACCURACY vs SIZE TRADE-OFF (SYNTHETIC DATA)")
         print("=" * 60)
         print(f"{'Model':<20} {'Size (KB)':<12} {'Test Acc':<12} {'Val Acc':<12}")
         print("-" * 60)
@@ -450,6 +449,7 @@ def run_ternary_baseline_comparison(args):
             'size_ratio': float(ratio),
             'accuracy_loss': float(acc_loss),
             'size_savings_percent': float(abs(size_gain)),
+            'data_source': 'synthetic',
             'trade_off_summary': f'Ternary: {abs(size_gain):.1f}% smaller but {acc_loss:.1f}% less accurate',
             'ternary_breakdown': {k: float(v/1024) for k, v in ternary_breakdown.items()}
         }
