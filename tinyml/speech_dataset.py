@@ -10,11 +10,8 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from pathlib import Path
 import torchaudio
 
-# Set backend to avoid torchcodec dependency
-try:
-    torchaudio.set_audio_backend("soundfile")
-except RuntimeError:
-    pass  # Backend might already be set or not available
+# Note: In torchaudio 2.1+, set_audio_backend() was removed
+# soundfile is automatically used if installed (which is in requirements.txt)
 
 from typing import Tuple, Dict, Optional
 
