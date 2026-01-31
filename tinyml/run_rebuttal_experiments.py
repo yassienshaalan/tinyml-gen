@@ -381,6 +381,46 @@ def run_ternary_baseline_comparison(args):
             )
             print(f"  Dataset: {meta.get('dataset_name', 'Apnea ECG')}")
             print(f"  Classes: {meta.get('num_classes', 2)}")
+            
+            # Train both models on real data
+            num_epochs = 10
+            hyper_test_acc, hyper_val_acc = train_and_evaluate(hyper_model, "HyperTinyPW", train_loader, val_loader, test_loader, num_epochs)
+            ternary_test_acc, ternary_val_acc = train_and_evaluate(ternary_model, "Ternary", train_loader, val_loader, test_loader, num_epochs)
+            
+            # Show the trade-off
+            print("\n" + "=" * 60)
+            print("ACCURACY vs SIZE TRADE-OFF (REAL DATA)")
+            print("=" * 60)
+            print(f"{'Model':<20} {'Size (KB)':<12} {'Test Acc':<12} {'Val Acc':<12}")
+            print("-" * 60)
+            print(f"{'HyperTinyPW':<20} {hyper_kb:<12.2f} {hyper_test_acc:<12.2f} {hyper_val_acc:<12.2f}")
+            print(f"{'Ternary (2-bit)':<20} {ternary_kb:<12.2f} {ternary_test_acc:<12.2f} {ternary_val_acc:<12.2f}")
+            print("=" * 60)
+            
+            acc_loss = hyper_test_acc - ternary_test_acc
+            size_gain = ((hyper_kb - ternary_kb) / hyper_kb) * 100
+            
+            print(f"\nTernary Trade-off:")
+            print(f"  ✓ Size: {abs(size_gain):.1f}% smaller ({ternary_kb:.2f} vs {hyper_kb:.2f} KB)")
+            if acc_loss > 0:
+                print(f"  ✗ Accuracy: {abs(acc_loss):.1f}% lower ({ternary_test_acc:.2f}% vs {hyper_test_acc:.2f}%)")
+            else:
+                print(f"  ✓ Accuracy: {abs(acc_loss):.1f}% higher! ({ternary_test_acc:.2f}% vs {hyper_test_acc:.2f}%)")
+            
+            results = {
+                'hypertiny_kb': float(hyper_kb),
+                'hypertiny_test_acc': float(hyper_test_acc),
+                'hypertiny_val_acc': float(hyper_val_acc),
+                'ternary_kb': float(ternary_kb),
+                'ternary_test_acc': float(ternary_test_acc),
+                'ternary_val_acc': float(ternary_val_acc),
+                'size_ratio': float(ratio),
+                'accuracy_loss': float(acc_loss),
+                'size_savings_percent': float(abs(size_gain)),
+                'data_source': 'real_apnea_ecg',
+                'trade_off_summary': f'Ternary: {abs(size_gain):.1f}% smaller, accuracy diff: {acc_loss:.1f}%',
+                'ternary_breakdown': {k: float(v/1024) for k, v in ternary_breakdown.items()}
+            }
         else:
             raise FileNotFoundError("Real data not available, using synthetic")
             
