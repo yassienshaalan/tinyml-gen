@@ -2,6 +2,8 @@ torch>=2.2
 torchaudio>=2.2
 numpy
 scikit-learn
-pandas
+pandas>=2.0.0,<3.0.0
 tqdm
 pydrive2
+wfdb>=4.1.0
+scipy
