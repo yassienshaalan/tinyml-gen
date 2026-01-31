@@ -31,16 +31,28 @@ pip3 install -r requirements.txt
 
 **Required packages** (from requirements.txt):
 ```
-torch>=1.10.0
-numpy>=1.19.0
-scipy>=1.5.0
-scikit-learn>=0.24.0
-torchaudio>=0.10.0
+torch>=2.2
+torchaudio>=2.2
+numpy
+scikit-learn
+pandas>=2.0.0,<3.0.0
+tqdm
+pydrive2
+wfdb>=4.1.0  # For ECG data loading
+scipy
 ```
 
-If requirements.txt is missing, install manually:
+If requirements.txt is missing or you get compatibility errors, install manually:
 ```bash
-pip3 install torch numpy scipy scikit-learn torchaudio
+pip3 install torch>=2.2 torchaudio>=2.2 numpy scikit-learn pandas tqdm wfdb>=4.1.0 scipy
+```
+
+**Common Issue - pandas/wfdb Compatibility:**
+If you see `TypeError: unhashable type: 'StringArray'`, update wfdb:
+```bash
+pip3 install --upgrade "wfdb>=4.1.0"
+# Or use the fix script:
+bash fix_dependencies.sh
 ```
 
 ## 3. Download Data
@@ -194,6 +206,15 @@ rebuttal_results/
 pip3 install torch torchaudio
 ```
 
+### "TypeError: unhashable type: 'StringArray'" (pandas/wfdb issue)
+```bash
+# Update wfdb to version compatible with pandas 2.x
+pip3 install --upgrade "wfdb>=4.1.0"
+
+# Or use the fix script
+bash fix_dependencies.sh
+```
+
 ### "SPEECH_COMMANDS_ROOT not set"
 ```bash
 export SPEECH_COMMANDS_ROOT=$(pwd)/data/speech_commands_v0.02
@@ -232,9 +253,12 @@ For a completely fresh Linux machine:
 ```bash
 # 1. Install dependencies
 sudo apt-get update && sudo apt-get install -y python3 python3-pip wget
-pip3 install torch numpy scipy scikit-learn torchaudio
+pip3 install -r requirements.txt
 
-# 2. Clone and enter repo
+# Fix pandas/wfdb compatibility if needed
+bash fix_dependencies.sh
+
+# 2. Clone and enter repo (if not already cloned)
 git clone https://github.com/yassienshaalan/tinyml-gen.git
 cd tinyml-gen
 
