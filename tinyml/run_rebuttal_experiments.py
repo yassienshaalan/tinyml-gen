@@ -16,6 +16,7 @@ from pathlib import Path
 import torch
 import numpy as np
 import datetime
+import subprocess
 
 
 class TeeLogger:
@@ -42,6 +43,15 @@ def setup_paths():
     script_dir = Path(__file__).parent
     sys.path.insert(0, str(script_dir))
 
+
+def get_git_commit():
+    """Get current git commit hash"""
+    try:
+        commit = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], 
+                                        stderr=subprocess.DEVNULL).decode('utf-8').strip()
+        return commit
+    except:
+        return "unknown"
 
 def setup_logging(output_dir):
     """Setup logging to both console and file"""
@@ -441,9 +451,18 @@ def main():
     else:
         experiments = [e.strip() for e in args.experiments.split(',')]
     
+    # Get git version info
+    git_commit = get_git_commit()
+    
     print("=" * 80)
     print("HYPERTINYPW REBUTTAL EXPERIMENTS")
     print("=" * 80)
+    print(f"\n[VERSION INFO]")
+    print(f"Git commit: {git_commit}")
+    print(f"Expected commits with bug fixes:")
+    print(f"  - 176cd90: Ternary comparison fix (correct compression calculation)")
+    print(f"  - 0767909: NAS compatibility fix (correct parameter counting)")
+    print(f"  - 81a34ae: Soundfile float32 fix (audio loading)")
     print(f"\nRunning experiments: {', '.join(experiments)}")
     print(f"Output directory: {args.output_dir}")
     print(f"Logging to: {log_path}")

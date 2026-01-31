@@ -2,6 +2,9 @@
 NAS Compatibility Experiment
 For rebuttal: demonstrate that HyperTinyPW can be applied to NAS-derived architectures
 Shows orthogonality to search-based methods like MCUNet/Once-for-All
+
+VERSION: Fixed compression calculation (commit 0767909)
+BUG FIX: Removed double-counting of generator overhead in compressed parameter count
 """
 import torch
 import torch.nn as nn
