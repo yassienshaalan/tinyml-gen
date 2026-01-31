@@ -9,9 +9,10 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 from pathlib import Path
 import torchaudio
+import soundfile as sf
 
 # Note: In torchaudio 2.1+, set_audio_backend() was removed
-# soundfile is automatically used if installed (which is in requirements.txt)
+# We use soundfile directly for audio loading to avoid torchcodec dependency
 
 from typing import Tuple, Dict, Optional
 
@@ -162,12 +163,16 @@ class SpeechCommandsDataset(Dataset):
         # Handle silence samples specially
         if isinstance(file_info, tuple) and file_info[0] == 'silence':
             _, bg_file, offset = file_info
-            waveform, sr = torchaudio.load(bg_file, backend="soundfile")
+            # Use soundfile directly to avoid torchcodec dependency
+            data, sr = sf.read(str(bg_file))
+            waveform = torch.from_numpy(data).T.unsqueeze(0) if data.ndim == 1 else torch.from_numpy(data).T
             # Extract random chunk
             start = min(offset, waveform.shape[1] - self.max_len)
             waveform = waveform[:, start:start + self.max_len]
         else:
-            waveform, sr = torchaudio.load(file_info, backend="soundfile")
+            # Use soundfile directly to avoid torchcodec dependency
+            data, sr = sf.read(str(file_info))
+            waveform = torch.from_numpy(data).T.unsqueeze(0) if data.ndim == 1 else torch.from_numpy(data).T
         
         # Resample if needed
         if sr != self.sr:
