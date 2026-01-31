@@ -72,7 +72,7 @@ def run_keyword_spotting_experiment(args):
     
     from speech_dataset import load_keyword_spotting_wrapper
     from models import safe_build_model
-    from experiments import ExpCfg, seed_everything, register_dataset
+    from experiments import ExpCfg, seed_everything, register_dataset, train_regular_cnn
     
     # Check if dataset is available
     root = os.environ.get('SPEECH_COMMANDS_ROOT', './data/speech_commands_v0.02')
@@ -88,32 +88,146 @@ def run_keyword_spotting_experiment(args):
     # Register dataset
     register_dataset('keyword_spotting', load_keyword_spotting_wrapper)
     
-    # Create experiment config
+    # Create experiment config (without 'dataset' parameter)
     cfg = ExpCfg(
-        dataset='keyword_spotting',
-        model='sharedcoreseparable1d',  # Your HyperTinyPW model
         batch_size=args.batch_size,
         epochs=args.epochs,
+        epochs_cnn=args.epochs,
         base=16,
         latent_dim=16,
+        lr=3e-4,
+        weight_decay=1e-4,
+        warmup_epochs=1,
+        device='cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
     )
     
-    print(f"\nTraining {cfg.model} on keyword spotting...")
+    print(f"\nTraining on keyword spotting dataset...")
     print(f"Batch size: {cfg.batch_size}, Epochs: {cfg.epochs}")
     
-    # Import training function (you'll need to adapt this to your experiments.py)
+    # Load keyword spotting data
     try:
-        from experiments import run_single_experiment
-        results = run_single_experiment(cfg)
+        train_loader, val_loader, test_loader = load_keyword_spotting_wrapper(
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers
+        )
+        
+        # Build model for 12-class classification (keyword spotting)
+        model = safe_build_model(
+            'sharedcoreseparable1d',
+            in_ch=1,
+            num_classes=12,  # 12 keywords
+            base=cfg.base,
+            latent_dim=cfg.latent_dim
+        )
+        
+        print(f"Model: {model.__class__.__name__}")
+        print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+        
+        # Train the model
+        device = cfg.device
+        model = model.to(device)
+        
+        # Simple training loop
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        criterion = torch.nn.CrossEntropyLoss()
+        
+        best_val_acc = 0
+        for epoch in range(cfg.epochs):
+            # Training
+            model.train()
+            train_loss = 0
+            train_correct = 0
+            train_total = 0
+            
+            for batch_idx, (x, y) in enumerate(train_loader):
+                x, y = x.to(device), y.to(device)
+                optimizer.zero_grad()
+                out = model(x)
+                loss = criterion(out, y)
+                loss.backward()
+                optimizer.step()
+                
+                train_loss += loss.item()
+                pred = out.argmax(dim=1)
+                train_correct += (pred == y).sum().item()
+                train_total += y.size(0)
+                
+                if batch_idx % 50 == 0:
+                    print(f"  Epoch {epoch+1}/{cfg.epochs} [{batch_idx}/{len(train_loader)}] "
+                          f"Loss: {loss.item():.4f}")
+            
+            train_acc = 100. * train_correct / train_total
+            
+            # Validation
+            model.eval()
+            val_loss = 0
+            val_correct = 0
+            val_total = 0
+            
+            with torch.no_grad():
+                for x, y in val_loader:
+                    x, y = x.to(device), y.to(device)
+                    out = model(x)
+                    loss = criterion(out, y)
+                    val_loss += loss.item()
+                    pred = out.argmax(dim=1)
+                    val_correct += (pred == y).sum().item()
+                    val_total += y.size(0)
+            
+            val_acc = 100. * val_correct / val_total
+            best_val_acc = max(best_val_acc, val_acc)
+            
+            print(f"Epoch {epoch+1}/{cfg.epochs}: "
+                  f"Train Loss: {train_loss/len(train_loader):.4f}, Train Acc: {train_acc:.2f}%, "
+                  f"Val Loss: {val_loss/len(val_loader):.4f}, Val Acc: {val_acc:.2f}%")
+        
+        # Test evaluation
+        model.eval()
+        test_correct = 0
+        test_total = 0
+        
+        with torch.no_grad():
+            for x, y in test_loader:
+                x, y = x.to(device), y.to(device)
+                out = model(x)
+                pred = out.argmax(dim=1)
+                test_correct += (pred == y).sum().item()
+                test_total += y.size(0)
+        
+        test_acc = 100. * test_correct / test_total
+        
+        # Calculate model size
+        model_params = sum(p.numel() for p in model.parameters())
+        model_size_kb = model_params * 4 / 1024  # FP32
+        
+        results = {
+            'test_acc': float(test_acc),
+            'best_val_acc': float(best_val_acc),
+            'model_size_kb': float(model_size_kb),
+            'model_params': int(model_params),
+            'dataset': 'speech_commands_v0.02',
+            'num_classes': 12,
+            'epochs': cfg.epochs
+        }
         
         print("\nResults:")
-        print(f"  Test Accuracy: {results.get('test_acc', 'N/A'):.2f}%")
-        print(f"  Model Size: {results.get('model_size_kb', 'N/A'):.2f} KB")
+        print(f"  Test Accuracy: {test_acc:.2f}%")
+        print(f"  Best Val Accuracy: {best_val_acc:.2f}%")
+        print(f"  Model Size: {model_size_kb:.2f} KB")
+        print(f"  Parameters: {model_params:,}")
+        
+        # Save results
+        output_path = Path(args.output_dir) / 'keyword_spotting_results.json'
+        with open(output_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\n✓ Results saved to: {output_path}")
         
         return results
+        
     except Exception as e:
         print(f"\nWARNING: Could not run training: {e}")
-        print("You may need to adapt the training loop for keyword spotting.")
+        import traceback
+        traceback.print_exc()
         return None
 
 
