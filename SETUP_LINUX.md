@@ -40,17 +40,26 @@ tqdm
 pydrive2
 wfdb>=4.1.0  # For ECG data loading
 scipy
+soundfile>=0.12.0  # For audio loading
 ```
 
 If requirements.txt is missing or you get compatibility errors, install manually:
 ```bash
-pip3 install torch>=2.2 torchaudio>=2.2 numpy scikit-learn pandas tqdm wfdb>=4.1.0 scipy
+pip3 install torch>=2.2 torchaudio>=2.2 numpy scikit-learn pandas tqdm wfdb>=4.1.0 scipy soundfile>=0.12.0
 ```
 
 **Common Issue - pandas/wfdb Compatibility:**
 If you see `TypeError: unhashable type: 'StringArray'`, update wfdb:
 ```bash
 pip3 install --upgrade "wfdb>=4.1.0"
+# Or use the fix script:
+bash fix_dependencies.sh
+```
+
+**Common Issue - Audio Loading (torchcodec):**
+If you see `ModuleNotFoundError: No module named 'torchcodec'`, install soundfile:
+```bash
+pip3 install --upgrade "soundfile>=0.12.0"
 # Or use the fix script:
 bash fix_dependencies.sh
 ```
@@ -210,6 +219,15 @@ pip3 install torch torchaudio
 ```bash
 # Update wfdb to version compatible with pandas 2.x
 pip3 install --upgrade "wfdb>=4.1.0"
+
+# Or use the fix script
+bash fix_dependencies.sh
+```
+
+### "ModuleNotFoundError: No module named 'torchcodec'" (audio loading)
+```bash
+# Install soundfile for audio loading (avoids torchcodec)
+pip3 install --upgrade "soundfile>=0.12.0"
 
 # Or use the fix script
 bash fix_dependencies.sh
