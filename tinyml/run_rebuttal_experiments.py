@@ -300,11 +300,11 @@ def run_ternary_baseline_comparison(args):
     ternary_kb = ternary_breakdown['total'] / 1024
     print(f"Ternary Baseline (2-bit):  {ternary_kb:.2f} KB")
     
-    # Calculate ratio correctly - ternary divided by hypertiny
-    ratio = ternary_kb / hyper_kb
-    savings_percent = ((ternary_kb - hyper_kb) / ternary_kb) * 100
+    # Calculate ratio correctly - hypertiny divided by ternary (shows how much smaller HyperTiny is)
+    ratio = hyper_kb / ternary_kb
+    savings_percent = ((ternary_kb - hyper_kb) / hyper_kb) * 100
     print(f"\nCompression Ratio: {ratio:.2f}x")
-    print(f"HyperTinyPW achieves {savings_percent:.1f}% additional savings vs Ternary")
+    print(f"Ternary achieves {savings_percent:.1f}% additional savings vs HyperTinyPW")
     
     print(f"\nTernary Breakdown:")
     for k, v in ternary_breakdown.items():
@@ -327,8 +327,8 @@ def run_ternary_baseline_comparison(args):
         'hypertiny_kb': float(hyper_kb),
         'ternary_kb': float(ternary_kb),
         'compression_ratio': float(ratio),
-        'hypertiny_savings_percent': float(savings_percent),
-        'comparison': f'HyperTinyPW is {savings_percent:.1f}% smaller than Ternary baseline',
+        'ternary_savings_percent': float(savings_percent),
+        'comparison': f'Ternary is {savings_percent:.1f}% smaller than HyperTinyPW (Ternary wins)',
         'ternary_breakdown': {k: float(v/1024) for k, v in ternary_breakdown.items()}
     }
     
