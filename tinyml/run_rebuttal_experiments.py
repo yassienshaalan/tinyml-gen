@@ -106,16 +106,24 @@ def run_keyword_spotting_experiment(args):
     
     # Load keyword spotting data
     try:
-        train_loader, val_loader, test_loader = load_keyword_spotting_wrapper(
+        train_loader, val_loader, test_loader, meta = load_keyword_spotting_wrapper(
             batch_size=cfg.batch_size,
-            num_workers=cfg.num_workers
+            num_workers=cfg.num_workers,
+            binary=False  # 12-class classification
         )
         
-        # Build model for 12-class classification (keyword spotting)
+        # Get number of classes from metadata
+        num_classes = meta['num_classes']
+        in_channels = meta['num_channels']  # MFCC channels
+        seq_len = meta['seq_len']  # Time frames
+        
+        print(f"Dataset info: {num_classes} classes, {in_channels} MFCC channels, {seq_len} time frames")
+        
+        # Build model for keyword spotting
         model = safe_build_model(
             'sharedcoreseparable1d',
-            in_ch=1,
-            num_classes=12,  # 12 keywords
+            in_ch=in_channels,  # MFCC features as input channels
+            num_classes=num_classes,
             base=cfg.base,
             latent_dim=cfg.latent_dim
         )
@@ -206,7 +214,10 @@ def run_keyword_spotting_experiment(args):
             'model_size_kb': float(model_size_kb),
             'model_params': int(model_params),
             'dataset': 'speech_commands_v0.02',
-            'num_classes': 12,
+            'num_classes': int(num_classes),
+            'input_channels': int(in_channels),
+            'sequence_length': int(seq_len),
+            'feature_type': meta['feature_type'],
             'epochs': cfg.epochs
         }
         
