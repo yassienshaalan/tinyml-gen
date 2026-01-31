@@ -77,10 +77,9 @@ def load_apnea_ecg_loaders_impl(root: str,
     # Try to call your existing function if it's importable in this environment
     # Expected signature: (root, length, stride, batch_size, num_workers, seed, verbose) -> (tr, va, te, meta) or (tr,va,te) + we add meta
     try:
-        from your_existing_module import load_apnea_ecg_loaders_impl as _impl  # <- replace if needed
+        from data_loaders import load_apnea_ecg_loaders_impl as _impl
         out = _impl(root=str(rootp), length=length, stride=stride,
-                    batch_size=batch_size, num_workers=num_workers,
-                    seed=seed, verbose=verbose)
+                    batch_size=batch_size, verbose=verbose, seed=seed)
         if isinstance(out, (tuple, list)) and len(out) == 4:
             return out
         elif isinstance(out, (tuple, list)) and len(out) == 3:
@@ -89,7 +88,7 @@ def load_apnea_ecg_loaders_impl(root: str,
             return tr, va, te, meta
         else:
             raise RuntimeError("Unexpected return from user apnea loader.")
-    except Exception:
+    except ImportError:
         # Fallback: simple torch.utils.data.DataLoader stubs — replace with your true dataset.
         raise RuntimeError(
             "Could not import your Apnea-ECG loader.\n"
