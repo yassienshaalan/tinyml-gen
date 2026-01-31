@@ -164,15 +164,21 @@ class SpeechCommandsDataset(Dataset):
         if isinstance(file_info, tuple) and file_info[0] == 'silence':
             _, bg_file, offset = file_info
             # Use soundfile directly to avoid torchcodec dependency
-            data, sr = sf.read(str(bg_file))
-            waveform = torch.from_numpy(data).T.unsqueeze(0) if data.ndim == 1 else torch.from_numpy(data).T
+            data, sr = sf.read(str(bg_file), dtype='float32')
+            if data.ndim == 1:
+                waveform = torch.from_numpy(data).unsqueeze(0)
+            else:
+                waveform = torch.from_numpy(data.T)
             # Extract random chunk
             start = min(offset, waveform.shape[1] - self.max_len)
             waveform = waveform[:, start:start + self.max_len]
         else:
             # Use soundfile directly to avoid torchcodec dependency
-            data, sr = sf.read(str(file_info))
-            waveform = torch.from_numpy(data).T.unsqueeze(0) if data.ndim == 1 else torch.from_numpy(data).T
+            data, sr = sf.read(str(file_info), dtype='float32')
+            if data.ndim == 1:
+                waveform = torch.from_numpy(data).unsqueeze(0)
+            else:
+                waveform = torch.from_numpy(data.T)
         
         # Resample if needed
         if sr != self.sr:
