@@ -162,12 +162,12 @@ class SpeechCommandsDataset(Dataset):
         # Handle silence samples specially
         if isinstance(file_info, tuple) and file_info[0] == 'silence':
             _, bg_file, offset = file_info
-            waveform, sr = torchaudio.load(bg_file)
+            waveform, sr = torchaudio.load(bg_file, backend="soundfile")
             # Extract random chunk
             start = min(offset, waveform.shape[1] - self.max_len)
             waveform = waveform[:, start:start + self.max_len]
         else:
-            waveform, sr = torchaudio.load(file_info)
+            waveform, sr = torchaudio.load(file_info, backend="soundfile")
         
         # Resample if needed
         if sr != self.sr:
