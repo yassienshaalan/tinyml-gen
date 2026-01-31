@@ -1,6 +1,9 @@
 """
 Ternary Weight Quantization Baseline
 For rebuttal: comparison to aggressive quantization approaches under matched flash budgets
+
+VERSION: Fixed compression calculation (commit 176cd90)
+BUG FIX: Corrected ternary compression factor from 0.8 to 0.08 (12x compression for 2-bit)
 """
 import torch
 import torch.nn as nn
