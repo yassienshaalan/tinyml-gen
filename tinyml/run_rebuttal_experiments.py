@@ -315,8 +315,28 @@ def run_ternary_baseline_comparison(args):
     ternary_model = ternary_model.to(device)
     
     # Try to load a simple dataset for training
-    try:
-        # Create synthetic data for quick validation
+    try:        # Try to use real ECG data first
+        from data_loaders import APNEA_ROOT
+        from datasets import register_apnea, get_or_make_loaders_once
+        import os
+        
+        # Check if real data is available
+        if os.path.exists(APNEA_ROOT) or APNEA_ROOT.startswith('gs://'):
+            print(f"Using REAL Apnea ECG dataset from: {APNEA_ROOT}")
+            register_apnea(APNEA_ROOT)
+            
+            train_loader, val_loader, test_loader, meta = get_or_make_loaders_once(
+                'apnea_ecg',
+                batch_size=32,
+                num_workers=0
+            )
+            print(f"  Dataset: {meta.get('dataset_name', 'Apnea ECG')}")
+            print(f"  Classes: {meta.get('num_classes', 2)}")
+        else:
+            raise FileNotFoundError("Real data not available, using synthetic")
+            
+    except Exception as e:
+        print(f"Could not load real data ({e}), creating synthetic data...")        # Create synthetic data for quick validation
         print("Creating synthetic binary classification data for quick validation...")
         from torch.utils.data import TensorDataset
         
@@ -537,10 +557,30 @@ def run_multi_scale_validation(args):
     
     device = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
     
-    # Load dataset
+    # Load dataset - try real data first, fall back to synthetic
     try:
-        # Use existing dataset from registry (needs to be registered first)
-        # For simplicity, create synthetic data for quick validation
+        # Try to use real ECG data first
+        from data_loaders import APNEA_ROOT
+        from datasets import register_apnea, get_or_make_loaders_once
+        import os
+        
+        # Check if real data is available
+        if os.path.exists(APNEA_ROOT) or APNEA_ROOT.startswith('gs://'):
+            print(f"Using REAL Apnea ECG dataset from: {APNEA_ROOT}")
+            register_apnea(APNEA_ROOT)
+            
+            train_loader, val_loader, test_loader, meta = get_or_make_loaders_once(
+                'apnea_ecg',
+                batch_size=32,
+                num_workers=0
+            )
+            print(f"  Dataset: {meta.get('dataset_name', 'Apnea ECG')}")
+            print(f"  Classes: {meta.get('num_classes', 2)}")
+        else:
+            raise FileNotFoundError("Real data not available, using synthetic")
+            
+    except Exception as e:
+        print(f"Could not load real data ({e}), creating synthetic data...")
         print("Creating synthetic binary classification data for quick validation...")
         from torch.utils.data import TensorDataset
         
