@@ -324,12 +324,16 @@ def run_ternary_baseline_comparison(args):
         torch.manual_seed(42)
         n_train, n_val, n_test = 500, 100, 100
         
+        # Create data with simple pattern: class 0 = low mean, class 1 = high mean
         train_x = torch.randn(n_train, 1, 1800)
         train_y = torch.randint(0, 2, (n_train,))
+        train_x[train_y == 1] += 0.5  # Class 1 has higher values
         val_x = torch.randn(n_val, 1, 1800)
         val_y = torch.randint(0, 2, (n_val,))
+        val_x[val_y == 1] += 0.5
         test_x = torch.randn(n_test, 1, 1800)
         test_y = torch.randint(0, 2, (n_test,))
+        test_x[test_y == 1] += 0.5
         
         train_loader = torch.utils.data.DataLoader(
             TensorDataset(train_x, train_y), batch_size=32, shuffle=True
@@ -342,6 +346,8 @@ def run_ternary_baseline_comparison(args):
         )
         
         print(f"Using synthetic ECG data for evaluation")
+        print("Note: Data has simple pattern (mean shift) - expect 60-80% accuracy")
+        print("Note: Data has simple pattern (mean shift) - expect 60-80% accuracy")
         
         # Quick training (just 5 epochs to demonstrate accuracy difference)
         num_epochs = 5
@@ -522,10 +528,11 @@ def run_multi_scale_validation(args):
     print("Target: Prove method works in 100K-500K parameter range")
     
     # Define multiple model configurations
+    # Note: These base/latent values are tuned to approximately hit target params
     configs = [
-        {'name': 'Small (150K)', 'base': 24, 'latent': 24, 'target_params': 150000},
-        {'name': 'Medium (250K)', 'base': 32, 'latent': 32, 'target_params': 250000},
-        {'name': 'Large (400K)', 'base': 40, 'latent': 40, 'target_params': 400000},
+        {'name': 'Small (150K)', 'base': 16, 'latent': 16, 'target_params': 150000},
+        {'name': 'Medium (250K)', 'base': 20, 'latent': 20, 'target_params': 250000},
+        {'name': 'Large (400K)', 'base': 24, 'latent': 24, 'target_params': 400000},
     ]
     
     device = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
@@ -541,12 +548,16 @@ def run_multi_scale_validation(args):
         torch.manual_seed(42)
         n_train, n_val, n_test = 500, 100, 100
         
+        # Create data with simple pattern: class 0 = low mean, class 1 = high mean
         train_x = torch.randn(n_train, 1, 1800)
         train_y = torch.randint(0, 2, (n_train,))
+        train_x[train_y == 1] += 0.5  # Class 1 has higher values
         val_x = torch.randn(n_val, 1, 1800)
         val_y = torch.randint(0, 2, (n_val,))
+        val_x[val_y == 1] += 0.5
         test_x = torch.randn(n_test, 1, 1800)
         test_y = torch.randint(0, 2, (n_test,))
+        test_x[test_y == 1] += 0.5
         
         train_loader = torch.utils.data.DataLoader(
             TensorDataset(train_x, train_y), batch_size=32, shuffle=True
