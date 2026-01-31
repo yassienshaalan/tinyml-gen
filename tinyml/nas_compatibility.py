@@ -222,16 +222,26 @@ class NASWithHyperTinyPW(nn.Module):
             head_params = sum(sum(p.numel() for p in head.parameters()) 
                             for head in self.pw_heads)
             
+            # DEBUG: Print what we're counting
+            print(f"  [DEBUG] Generator params: {gen_params:,}")
+            print(f"  [DEBUG] Head params total: {head_params:,}")
+            print(f"  [DEBUG] Number of heads: {len(self.pw_heads)}")
+            
             # Total params in PW layers that we're compressing
             pw_layer_params = sum(spec['weight_size'] for spec in self.compressed_pw_specs)
+            print(f"  [DEBUG] PW params being replaced: {pw_layer_params:,}")
             
             # Size of uncompressed parts (DW, BN, classifier, etc.)
             other_params = orig_params - pw_layer_params
+            print(f"  [DEBUG] Other params (DW, BN, etc.): {other_params:,}")
             
             # Compressed size = generator + heads + non-PW layers
             # PW layers are synthesized, so we don't store them
             compressed_params = gen_params + head_params + other_params
             compressed_bytes = compressed_params * 4  # FP32
+            
+            print(f"  [DEBUG] Total compressed params: {compressed_params:,}")
+            print(f"  [DEBUG] Original params: {orig_params:,}")
             
             stats['original_kb'] = orig_bytes / 1024
             stats['compressed_kb'] = compressed_bytes / 1024
