@@ -342,18 +342,18 @@ def run_ternary_baseline_comparison(args):
         
         # Generate synthetic ECG-like data
         torch.manual_seed(42)
-        n_train, n_val, n_test = 500, 100, 100
+        n_train, n_val, n_test = 1000, 200, 200  # More data for stable training
         
-        # Create data with simple pattern: class 0 = low mean, class 1 = high mean
+        # Create data with simple but clear pattern: class 0 = low mean, class 1 = high mean
         train_x = torch.randn(n_train, 1, 1800)
         train_y = torch.randint(0, 2, (n_train,))
-        train_x[train_y == 1] += 0.5  # Class 1 has higher values
+        train_x[train_y == 1] += 1.0  # Class 1 has significantly higher values
         val_x = torch.randn(n_val, 1, 1800)
         val_y = torch.randint(0, 2, (n_val,))
-        val_x[val_y == 1] += 0.5
+        val_x[val_y == 1] += 1.0
         test_x = torch.randn(n_test, 1, 1800)
         test_y = torch.randint(0, 2, (n_test,))
-        test_x[test_y == 1] += 0.5
+        test_x[test_y == 1] += 1.0
         
         train_loader = torch.utils.data.DataLoader(
             TensorDataset(train_x, train_y), batch_size=32, shuffle=True
@@ -366,11 +366,10 @@ def run_ternary_baseline_comparison(args):
         )
         
         print(f"Using synthetic ECG data for evaluation")
-        print("Note: Data has simple pattern (mean shift) - expect 60-80% accuracy")
-        print("Note: Data has simple pattern (mean shift) - expect 60-80% accuracy")
+        print("Note: Data has clear pattern (mean shift +1.0) - expect 70-95% accuracy")
         
-        # Quick training (just 5 epochs to demonstrate accuracy difference)
-        num_epochs = 5
+        # Quick training (10 epochs for more stable convergence)
+        num_epochs = 10
         
         def train_and_evaluate(model, name):
             print(f"\n[{name}]")
