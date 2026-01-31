@@ -20,6 +20,48 @@ python run_rebuttal_experiments.py --experiments all --epochs 20     # Run all e
 
 ## Data Sources
 
+### Using REAL ECG Data (Recommended)
+
+**Your experiments now automatically use REAL data when available!**
+
+The ternary and multi-scale experiments will:
+1. ✅ **Try to load real Apnea ECG data** from GCP bucket or local folder
+2. ⚠️ **Fall back to synthetic data** only if real data not found
+
+**To download real data from GCP bucket:**
+```bash
+# Install Google Cloud SDK first (if not already installed)
+# https://cloud.google.com/sdk/docs/install
+
+# Authenticate
+gcloud auth login
+
+# Download Apnea ECG dataset (~500MB)
+python download_ecg_data.py --dataset apnea --target-dir ./data
+
+# Set environment variable (Linux/Mac)
+export APNEA_ROOT=$(pwd)/data/apnea
+
+# Or on Windows
+set APNEA_ROOT=%CD%\data\apnea
+
+# Now run experiments - will use REAL data!
+cd tinyml
+python run_rebuttal_experiments.py --experiments ternary,synthesis,multi_scale
+```
+
+**Alternative: Point to existing data**
+If you already have the data elsewhere:
+```bash
+# Linux/Mac
+export APNEA_ROOT=/path/to/existing/apnea-ecg-database-1.0.0
+
+# Windows
+set APNEA_ROOT=C:\path\to\existing\apnea-ecg-database-1.0.0
+```
+
+---
+
 ### Experiments Using EXISTING Data (No Download Needed)
 
 These experiments work with your **existing ECG datasets** or run synthetically:
