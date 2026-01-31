@@ -214,25 +214,29 @@ class NASWithHyperTinyPW(nn.Module):
         orig_bytes = orig_params * 4  # FP32
         
         if self.compress_pw and hasattr(self, 'gen'):
-            # Size of generator + heads
+            # Size of generator + heads (amortized overhead)
             gen_params = sum(p.numel() for p in self.gen.parameters())
             head_params = sum(sum(p.numel() for p in head.parameters()) 
                             for head in self.pw_heads)
             
-            # Size of compressed PW layers (we store only residuals or codes)
-            compressed_pw_bytes = sum(spec['weight_size'] for spec in self.compressed_pw_specs) * 1  # INT8 residuals
-            
-            # Size of uncompressed parts
+            # Total params in PW layers that we're compressing
             pw_layer_params = sum(spec['weight_size'] for spec in self.compressed_pw_specs)
+            
+            # Size of uncompressed parts (DW, BN, classifier, etc.)
             other_params = orig_params - pw_layer_params
             
-            compressed_bytes = (gen_params + head_params + other_params) * 4 + compressed_pw_bytes
+            # Compressed size = generator + heads + non-PW layers
+            # PW layers are synthesized, so we don't store them
+            compressed_params = gen_params + head_params + other_params
+            compressed_bytes = compressed_params * 4  # FP32
             
             stats['original_kb'] = orig_bytes / 1024
             stats['compressed_kb'] = compressed_bytes / 1024
             stats['compression_ratio'] = orig_bytes / compressed_bytes
             stats['savings_kb'] = (orig_bytes - compressed_bytes) / 1024
             stats['num_compressed_layers'] = len(self.compressed_pw_specs)
+            stats['pw_params_removed'] = pw_layer_params
+            stats['generator_params'] = gen_params + head_params
         else:
             stats['original_kb'] = orig_bytes / 1024
             stats['compressed_kb'] = orig_bytes / 1024
