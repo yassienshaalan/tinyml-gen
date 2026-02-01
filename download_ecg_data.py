@@ -120,9 +120,6 @@ def main():
     print(f"\nTarget directory: {args.target_dir}")
     print(f"Dataset(s): {args.dataset}")
     
-    if args.dry_run:
-        print("\n[DRY RUN MODE - No files will be downloaded]")
-    
     # Determine which datasets to download
     if args.dataset == 'all':
         datasets_to_download = list(DATASETS.keys())
