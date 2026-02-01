@@ -320,7 +320,7 @@ def run_ternary_baseline_comparison(args):
         
         # Setup optimizer with learning rate scheduling
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=True)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
         
         # Use class weights if provided (for imbalanced datasets)
         if class_weights is not None:
