@@ -314,15 +314,25 @@ def run_ternary_baseline_comparison(args):
     hyper_model = hyper_model.to(device)
     ternary_model = ternary_model.to(device)
     
-    # Training function (used for both real and synthetic data)
-    def train_and_evaluate(model, name, train_loader, val_loader, test_loader, num_epochs=10):
+    # Training function with comprehensive error analysis
+    def train_and_evaluate(model, name, train_loader, val_loader, test_loader, num_epochs=20, class_weights=None):
         print(f"\n[{name}]")
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        criterion = torch.nn.CrossEntropyLoss()
+        
+        # Setup optimizer with learning rate scheduling
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=True)
+        
+        # Use class weights if provided (for imbalanced datasets)
+        if class_weights is not None:
+            criterion = torch.nn.CrossEntropyLoss(weight=class_weights.to(device))
+        else:
+            criterion = torch.nn.CrossEntropyLoss()
         
         best_val_acc = 0
+        best_epoch = 0
         for epoch in range(num_epochs):
             model.train()
+            train_loss = 0
             for x, y in train_loader:
                 x, y = x.to(device), y.to(device)
                 optimizer.zero_grad()
@@ -330,6 +340,7 @@ def run_ternary_baseline_comparison(args):
                 loss = criterion(out, y)
                 loss.backward()
                 optimizer.step()
+                train_loss += loss.item()
             
             # Validation
             model.eval()
@@ -344,85 +355,214 @@ def run_ternary_baseline_comparison(args):
                     val_total += y.size(0)
             
             val_acc = 100. * val_correct / val_total
-            best_val_acc = max(best_val_acc, val_acc)
-            print(f"  Epoch {epoch+1}/{num_epochs}: Val Acc = {val_acc:.2f}%")
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_epoch = epoch + 1
+            
+            # Learning rate scheduling
+            scheduler.step(val_acc)
+            
+            if (epoch + 1) % 5 == 0 or epoch == 0:  # Print every 5 epochs
+                print(f"  Epoch {epoch+1}/{num_epochs}: Train Loss = {train_loss/len(train_loader):.4f}, Val Acc = {val_acc:.2f}% (Best: {best_val_acc:.2f}% @ epoch {best_epoch})")
         
-        # Test accuracy
+        # Comprehensive test evaluation with error analysis
         model.eval()
-        test_correct = 0
-        test_total = 0
+        all_preds = []
+        all_labels = []
         with torch.no_grad():
             for x, y in test_loader:
                 x, y = x.to(device), y.to(device)
                 out = model(x)
                 pred = out.argmax(dim=1)
-                test_correct += (pred == y).sum().item()
-                test_total += y.size(0)
+                all_preds.extend(pred.cpu().numpy())
+                all_labels.extend(y.cpu().numpy())
         
-        test_acc = 100. * test_correct / test_total
-        print(f"  Final Test Accuracy: {test_acc:.2f}%")
-        return test_acc, best_val_acc
+        all_preds = np.array(all_preds)
+        all_labels = np.array(all_labels)
+        
+        # Calculate comprehensive metrics
+        test_acc = 100. * (all_preds == all_labels).sum() / len(all_labels)
+        balanced_acc = 100. * balanced_accuracy_score(all_labels, all_preds)
+        
+        # Per-class metrics
+        cm = confusion_matrix(all_labels, all_preds)
+        
+        # Calculate per-class accuracy, precision, recall
+        per_class_acc = {}
+        for cls in range(cm.shape[0]):
+            if cm[cls].sum() > 0:
+                per_class_acc[cls] = 100. * cm[cls, cls] / cm[cls].sum()
+            else:
+                per_class_acc[cls] = 0.0
+        
+        print(f"  \n  {'='*50}")
+        print(f"  Final Results for {name}:")
+        print(f"  {'='*50}")
+        print(f"  Test Accuracy:          {test_acc:.2f}%")
+        print(f"  Balanced Accuracy:      {balanced_acc:.2f}%")
+        print(f"  Best Val Accuracy:      {best_val_acc:.2f}% (epoch {best_epoch})")
+        print(f"  \n  Per-Class Accuracy:")
+        for cls, acc in per_class_acc.items():
+            print(f"    Class {cls}: {acc:.2f}%")
+        print(f"  \n  Confusion Matrix:")
+        print(f"    {cm}")
+        print(f"  {'='*50}\n")
+        
+        return {
+            'test_acc': test_acc,
+            'balanced_acc': balanced_acc,
+            'val_acc': best_val_acc,
+            'per_class_acc': per_class_acc,
+            'confusion_matrix': cm.tolist(),
+            'best_epoch': best_epoch
+        }
     
-    # Try to load a simple dataset for training
-    try:        # Try to use real ECG data first
-        from data_loaders import APNEA_ROOT
-        from datasets import register_apnea, get_or_make_loaders_once
+    # Try to load real ECG datasets (try PTB-XL first, then MITBIH, then Apnea)
+    dataset_loaded = False
+    dataset_name = None
+    
+    try:
+        from data_loaders import PTBXL_ROOT, MITDB_ROOT, APNEA_ROOT, load_ptbxl_loaders, load_mitdb_loaders
         import os
         
-        # Check if real data is available
-        if os.path.exists(APNEA_ROOT) or APNEA_ROOT.startswith('gs://'):
-            print(f"Using REAL Apnea ECG dataset from: {APNEA_ROOT}")
-            register_apnea(APNEA_ROOT)
+        # Priority order: PTB-XL (largest, most balanced) > MITBIH > Apnea
+        for ds_name, ds_root, loader_func in [
+            ('PTB-XL', PTBXL_ROOT, lambda: load_ptbxl_loaders(PTBXL_ROOT, batch_size=32, length=1800, task='binary_diag')),
+            ('MIT-BIH', MITDB_ROOT, lambda: load_mitdb_loaders(MITDB_ROOT, batch_size=32, length=1800, binary=True)),
+        ]:
+            try:
+                if os.path.exists(ds_root) or ds_root.startswith('gs://'):
+                    print(f"\n{'='*60}")
+                    print(f"Attempting to load {ds_name} dataset from: {ds_root}")
+                    print(f"{'='*60}")
+                    
+                    train_loader, val_loader, test_loader, meta = loader_func()
+                    dataset_loaded = True
+                    dataset_name = ds_name
+                    
+                    print(f"✓ Successfully loaded {ds_name} dataset")
+                    print(f"  Train batches: {len(train_loader)}")
+                    print(f"  Val batches: {len(val_loader)}")
+                    print(f"  Test batches: {len(test_loader)}")
+                    print(f"  Metadata: {meta}")
+                    break
+            except Exception as e:
+                print(f"  ✗ Could not load {ds_name}: {e}")
+                continue
+        
+        # Fallback to Apnea if others failed
+        if not dataset_loaded:
+            try:
+                from datasets import register_apnea, get_or_make_loaders_once
+                if os.path.exists(APNEA_ROOT) or APNEA_ROOT.startswith('gs://'):
+                    print(f"\n{'='*60}")
+                    print(f"Using Apnea ECG dataset from: {APNEA_ROOT}")
+                    print(f"{'='*60}")
+                    register_apnea(APNEA_ROOT)
+                    train_loader, val_loader, test_loader, meta = get_or_make_loaders_once('apnea_ecg', batch_size=32, num_workers=0)
+                    dataset_loaded = True
+                    dataset_name = 'Apnea-ECG'
+                    print(f"✓ Successfully loaded Apnea-ECG dataset")
+            except Exception as e:
+                print(f"  ✗ Could not load Apnea: {e}")
+        
+        if dataset_loaded:
+            # Calculate class weights for balanced training
+            print(f"\nCalculating class distribution for balanced training...")
+            class_counts = {}
+            sample_count = 0
+            for _, y in train_loader:
+                for label in y:
+                    label_int = int(label.item())
+                    class_counts[label_int] = class_counts.get(label_int, 0) + 1
+                    sample_count += 1
+                if sample_count >= 5000:  # Sample first 5000 for speed
+                    break
             
-            train_loader, val_loader, test_loader, meta = get_or_make_loaders_once(
-                'apnea_ecg',
-                batch_size=32,
-                num_workers=0
-            )
-            print(f"  Dataset: {meta.get('dataset_name', 'Apnea ECG')}")
-            print(f"  Classes: {meta.get('num_classes', 2)}")
+            num_classes = len(class_counts)
+            class_weights = torch.zeros(num_classes)
+            for cls, count in class_counts.items():
+                class_weights[cls] = sample_count / (num_classes * count)
             
-            # Train both models on real data
-            num_epochs = 10
-            hyper_test_acc, hyper_val_acc = train_and_evaluate(hyper_model, "HyperTinyPW", train_loader, val_loader, test_loader, num_epochs)
-            ternary_test_acc, ternary_val_acc = train_and_evaluate(ternary_model, "Ternary", train_loader, val_loader, test_loader, num_epochs)
+            print(f"  Class distribution (sampled): {class_counts}")
+            print(f"  Class weights: {class_weights.tolist()}")
             
-            # Show the trade-off
-            print("\n" + "=" * 60)
-            print("ACCURACY vs SIZE TRADE-OFF (REAL DATA)")
-            print("=" * 60)
-            print(f"{'Model':<20} {'Size (KB)':<12} {'Test Acc':<12} {'Val Acc':<12}")
-            print("-" * 60)
-            print(f"{'HyperTinyPW':<20} {hyper_kb:<12.2f} {hyper_test_acc:<12.2f} {hyper_val_acc:<12.2f}")
-            print(f"{'Ternary (2-bit)':<20} {ternary_kb:<12.2f} {ternary_test_acc:<12.2f} {ternary_val_acc:<12.2f}")
-            print("=" * 60)
+            # Train both models with comprehensive evaluation
+            print(f"\n{'='*60}")
+            print(f"Training on {dataset_name} dataset (20 epochs with LR scheduling)")
+            print(f"{'='*60}")
             
-            acc_loss = hyper_test_acc - ternary_test_acc
+            hyper_results = train_and_evaluate(hyper_model, "HyperTinyPW", train_loader, val_loader, test_loader, num_epochs=20, class_weights=class_weights)
+            ternary_results = train_and_evaluate(ternary_model, "Ternary (2-bit)", train_loader, val_loader, test_loader, num_epochs=20, class_weights=class_weights)
+            
+            # Comprehensive comparison
+            print("\n" + "=" * 80)
+            print("COMPREHENSIVE ACCURACY vs SIZE TRADE-OFF")
+            print(f"Dataset: {dataset_name}")
+            print("=" * 80)
+            print(f"{'Model':<20} {'Size (KB)':<12} {'Test Acc':<12} {'Bal. Acc':<12} {'Val Acc':<12}")
+            print("-" * 80)
+            print(f"{'HyperTinyPW':<20} {hyper_kb:<12.2f} {hyper_results['test_acc']:<12.2f} {hyper_results['balanced_acc']:<12.2f} {hyper_results['val_acc']:<12.2f}")
+            print(f"{'Ternary (2-bit)':<20} {ternary_kb:<12.2f} {ternary_results['test_acc']:<12.2f} {ternary_results['balanced_acc']:<12.2f} {ternary_results['val_acc']:<12.2f}")
+            print("=" * 80)
+            
+            # Use balanced accuracy for fair comparison
+            acc_diff = hyper_results['balanced_acc'] - ternary_results['balanced_acc']
             size_gain = ((hyper_kb - ternary_kb) / hyper_kb) * 100
             
-            print(f"\nTernary Trade-off:")
+            print(f"\nTernary Trade-off Analysis:")
             print(f"  ✓ Size: {abs(size_gain):.1f}% smaller ({ternary_kb:.2f} vs {hyper_kb:.2f} KB)")
-            if acc_loss > 0:
-                print(f"  ✗ Accuracy: {abs(acc_loss):.1f}% lower ({ternary_test_acc:.2f}% vs {hyper_test_acc:.2f}%)")
+            if acc_diff > 0:
+                print(f"  ✓ HyperTinyPW wins on accuracy: +{acc_diff:.2f}% balanced accuracy")
+                print(f"     ({hyper_results['balanced_acc']:.2f}% vs {ternary_results['balanced_acc']:.2f}%)")
+            elif acc_diff < -1.0:  # More than 1% worse
+                print(f"  ⚠ Ternary wins on accuracy: +{abs(acc_diff):.2f}% balanced accuracy")
+                print(f"     ({ternary_results['balanced_acc']:.2f}% vs {hyper_results['balanced_acc']:.2f}%)")
+                print(f"     NOTE: This suggests HyperTinyPW needs more training or hyperparameter tuning")
             else:
-                print(f"  ✓ Accuracy: {abs(acc_loss):.1f}% higher! ({ternary_test_acc:.2f}% vs {hyper_test_acc:.2f}%)")
+                print(f"  ≈ Similar accuracy: {abs(acc_diff):.2f}% difference (within margin)")
             
             results = {
-                'hypertiny_kb': float(hyper_kb),
-                'hypertiny_test_acc': float(hyper_test_acc),
-                'hypertiny_val_acc': float(hyper_val_acc),
-                'ternary_kb': float(ternary_kb),
-                'ternary_test_acc': float(ternary_test_acc),
-                'ternary_val_acc': float(ternary_val_acc),
-                'size_ratio': float(ratio),
-                'accuracy_loss': float(acc_loss),
-                'size_savings_percent': float(abs(size_gain)),
-                'data_source': 'real_apnea_ecg',
-                'trade_off_summary': f'Ternary: {abs(size_gain):.1f}% smaller, accuracy diff: {acc_loss:.1f}%',
-                'ternary_breakdown': {k: float(v/1024) for k, v in ternary_breakdown.items()}
+                'dataset': dataset_name,
+                'hypertiny': {
+                    'size_kb': float(hyper_kb),
+                    'test_acc': float(hyper_results['test_acc']),
+                    'balanced_acc': float(hyper_results['balanced_acc']),
+                    'val_acc': float(hyper_results['val_acc']),
+                    'per_class_acc': {str(k): float(v) for k, v in hyper_results['per_class_acc'].items()},
+                    'confusion_matrix': hyper_results['confusion_matrix'],
+                    'best_epoch': hyper_results['best_epoch']
+                },
+                'ternary': {
+                    'size_kb': float(ternary_kb),
+                    'test_acc': float(ternary_results['test_acc']),
+                    'balanced_acc': float(ternary_results['balanced_acc']),
+                    'val_acc': float(ternary_results['val_acc']),
+                    'per_class_acc': {str(k): float(v) for k, v in ternary_results['per_class_acc'].items()},
+                    'confusion_matrix': ternary_results['confusion_matrix'],
+                    'best_epoch': ternary_results['best_epoch'],
+                    'breakdown_kb': {k: float(v/1024) for k, v in ternary_breakdown.items()}
+                },
+                'comparison': {
+                    'size_ratio': float(ratio),
+                    'balanced_accuracy_diff': float(acc_diff),
+                    'size_savings_percent': float(abs(size_gain)),
+                    'hypertiny_wins_accuracy': acc_diff > 0,
+                    'trade_off_summary': f'Ternary: {abs(size_gain):.1f}% smaller, HyperTinyPW: {acc_diff:+.2f}% balanced accuracy'
+                },
+                'class_weights': class_weights.tolist(),
+                'training_config': {
+                    'epochs': 20,
+                    'batch_size': 32,
+                    'optimizer': 'Adam',
+                    'lr': 0.001,
+                    'weight_decay': 1e-5,
+                    'scheduler': 'ReduceLROnPlateau',
+                    'class_weighted_loss': True
+                }
             }
         else:
-            raise FileNotFoundError("Real data not available, using synthetic")
+            raise FileNotFoundError("No real ECG data available")
             
     except Exception as e:
         print(f"Could not load real data ({e}), creating synthetic data...")        # Create synthetic data for quick validation

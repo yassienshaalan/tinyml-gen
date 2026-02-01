@@ -96,22 +96,21 @@ def load_apnea_ecg_loaders_impl(root: str,
             "and import it here."
         )
 
-# ---- PTB-XL / MITDB wrappers (call your own loaders if you have them) ----
+# ---- PTB-XL / MITDB wrappers (use data_loaders.py implementations) ----
 def load_ptbxl_loaders_impl(root: str,
                             batch_size: int = 64,
                             num_workers: int = 0,
                             **kwargs):
     rootp = _require_dir(root)
     try:
-        from your_existing_module import run_ptbxl as _ptb  # expects a function that returns dict w/ loaders
-        cfg = kwargs.copy()
-        cfg.setdefault('batch_size', batch_size)
-        cfg.setdefault('num_workers', num_workers)
-        result = _ptb(cfg, str(rootp))
-        dl_tr, dl_va, dl_te, meta = result['dl_tr'], result['dl_va'], result.get('dl_te'), result['meta']
+        from data_loaders import load_ptbxl_loaders as _ptb_loader
+        task = kwargs.get('task', 'binary_diag')
+        length = kwargs.get('length', 1800)
+        lead = kwargs.get('lead', 'II')
+        dl_tr, dl_va, dl_te, meta = _ptb_loader(root=str(rootp), batch_size=batch_size, length=length, task=task, lead=lead)
         return dl_tr, dl_va, dl_te, meta
-    except Exception:
-        raise RuntimeError("PTB-XL loader not wired. Replace import above with your loader or add one.")
+    except Exception as e:
+        raise RuntimeError(f"PTB-XL loader failed: {e}")
 
 def load_mitdb_loaders_impl(root: str,
                             batch_size: int = 64,
@@ -119,15 +118,13 @@ def load_mitdb_loaders_impl(root: str,
                             **kwargs):
     rootp = _require_dir(root)
     try:
-        from your_existing_module import run_mitdb as _mit
-        cfg = kwargs.copy()
-        cfg.setdefault('batch_size', batch_size)
-        cfg.setdefault('num_workers', num_workers)
-        result = _mit(cfg, str(rootp))
-        dl_tr, dl_va, dl_te, meta = result['dl_tr'], result['dl_va'], result.get('dl_te'), result['meta']
+        from data_loaders import load_mitdb_loaders as _mit_loader
+        length = kwargs.get('length', 1800)
+        binary = kwargs.get('binary', True)
+        dl_tr, dl_va, dl_te, meta = _mit_loader(root=str(rootp), batch_size=batch_size, length=length, binary=binary)
         return dl_tr, dl_va, dl_te, meta
-    except Exception:
-        raise RuntimeError("MIT-BIH loader not wired. Replace import above with your loader or add one.")
+    except Exception as e:
+        raise RuntimeError(f"MIT-BIH loader failed: {e}")
 
 # --------------- Registration helpers ---------------
 def register_apnea(root: str):
