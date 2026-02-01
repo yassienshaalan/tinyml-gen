@@ -17,9 +17,18 @@ from pathlib import Path
 # GCP bucket paths (from your data_loaders.py)
 GCP_BASE = "gs://store-pepper/tinyml_hyper_tiny_baselines/data"
 DATASETS = {
-    'apnea': f"{GCP_BASE}/apnea-ecg-database-1.0.0",
-    'ptbxl': f"{GCP_BASE}/ptbxl",
-    'mitdb': f"{GCP_BASE}/mitbih/raw",
+    'apnea': {
+        'gcs': f"{GCP_BASE}/apnea-ecg-database-1.0.0",
+        'check_file': 'a01.dat',  # File that should exist if downloaded
+    },
+    'ptbxl': {
+        'gcs': f"{GCP_BASE}/ptbxl",
+        'check_file': 'raw/ptbxl_database.csv',
+    },
+    'mitbih': {
+        'gcs': f"{GCP_BASE}/mitbih/raw",
+        'check_file': '100.dat',
+    },
 }
 
 
@@ -32,9 +41,25 @@ def check_gsutil():
         return False
 
 
-def download_dataset(dataset_name, gcs_path, local_path):
+def is_already_downloaded(local_path, check_file):
+    """Check if dataset already exists locally"""
+    check_path = Path(local_path) / check_file
+    exists = check_path.exists()
+    if exists:
+        print(f"  ✓ Already downloaded: {check_path} exists")
+    return exists
+
+
+def download_dataset(dataset_name, gcs_path, local_path, check_file):
     """Download dataset from GCS to local path"""
     local_path = Path(local_path)
+    
+    # Check if already downloaded
+    if is_already_downloaded(local_path, check_file):
+        print(f"  → Skipping {dataset_name} (already downloaded)")
+        return 'skipped'
+    
+    local_path.mkdir(parents=True, exist_ok=True)
     local_path.mkdir(parents=True, exist_ok=True)
     
     print(f"\n{'='*80}")
@@ -62,9 +87,9 @@ def main():
     parser.add_argument(
         '--dataset',
         type=str,
-        default='apnea',
-        choices=['apnea', 'ptbxl', 'mitdb', 'all'],
-        help='Which dataset to download (default: apnea)'
+        default='all',
+        choices=['apnea', 'ptbxl', 'mitbih', 'all'],
+        help='Which dataset to download (default: all)'
     )
     parser.add_argument(
         '--target-dir',
@@ -73,9 +98,9 @@ def main():
         help='Local directory to download to (default: ./data)'
     )
     parser.add_argument(
-        '--dry-run',
+        '--force',
         action='store_true',
-        help='Show what would be downloaded without actually downloading'
+        help='Force re-download even if data exists'
     )
     
     args = parser.parse_args()
@@ -100,40 +125,53 @@ def main():
     
     # Determine which datasets to download
     if args.dataset == 'all':
-        datasets_to_download = DATASETS.items()
+        datasets_to_download = list(DATASETS.keys())
     else:
-        datasets_to_download = [(args.dataset, DATASETS[args.dataset])]
+        datasets_to_download = [args.dataset]
+    
+    print(f"Datasets to process: {', '.join(datasets_to_download)}")
+    print(f"Force re-download: {args.force}")
     
     # Download each dataset
-    success_count = 0
-    for name, gcs_path in datasets_to_download:
-        local_path = Path(args.target_dir) / name
+    results = {}
+    for ds_name in datasets_to_download:
+        ds_info = DATASETS[ds_name]
+        local_path = Path(args.target_dir) / ds_name
         
-        if args.dry_run:
-            print(f"\nWould download:")
-            print(f"  {name}: {gcs_path} -> {local_path}")
+        if args.force or not is_already_downloaded(local_path, ds_info['check_file']):
+            status = download_dataset(ds_name.upper(), ds_info['gcs'], local_path, ds_info['check_file'])
+            results[ds_name] = status if status != 'skipped' else True
         else:
-            if download_dataset(name, gcs_path, local_path):
-                success_count += 1
+            results[ds_name] = 'skipped'
     
     # Summary
     print("\n" + "=" * 80)
-    if args.dry_run:
-        print("DRY RUN COMPLETE")
-    else:
-        print("DOWNLOAD COMPLETE")
-        print(f"  {success_count}/{len(list(datasets_to_download))} dataset(s) downloaded successfully")
+    print("Download Summary:")
+    print("=" * 80)
+    for ds_name, status in results.items():
+        if status == 'skipped':
+            print(f"  {ds_name.upper():<15} ✓ Already downloaded")
+        elif status:
+            print(f"  {ds_name.upper():<15} ✓ Downloaded successfully")
+        else:
+            print(f"  {ds_name.upper():<15} ✗ Download failed")
+    
+    success_count = sum(1 for s in results.values() if s in [True, 'skipped'])
+    print(f"\n{success_count}/{len(datasets_to_download)} datasets ready")
     print("=" * 80)
     
-    if not args.dry_run and success_count > 0:
-        print("\nTo use the downloaded data:")
-        print(f"  export APNEA_ROOT={Path(args.target_dir).absolute() / 'apnea'}")
-        print(f"  export PTBXL_ROOT={Path(args.target_dir).absolute() / 'ptbxl'}")
-        print(f"  export MITDB_ROOT={Path(args.target_dir).absolute() / 'mitdb'}")
-        print("\nOr on Windows:")
-        print(f"  set APNEA_ROOT={Path(args.target_dir).absolute() / 'apnea'}")
-        print(f"  set PTBXL_ROOT={Path(args.target_dir).absolute() / 'ptbxl'}")
-        print(f"  set MITDB_ROOT={Path(args.target_dir).absolute() / 'mitdb'}")
+    if success_count > 0:
+        print("\nEnvironment Variables (set these before running experiments):")
+        for ds_name in datasets_to_download:
+            local_path = Path(args.target_dir).absolute() / ds_name
+            env_var = f"{ds_name.upper()}_ROOT" if ds_name != 'mitbih' else 'MITDB_ROOT'
+            print(f'export {env_var}="{local_path}"')
+        
+        print("\nOr add to ~/.bashrc:")
+        for ds_name in datasets_to_download:
+            local_path = Path(args.target_dir).absolute() / ds_name
+            env_var = f"{ds_name.upper()}_ROOT" if ds_name != 'mitbih' else 'MITDB_ROOT'
+            print(f'echo \'export {env_var}="{local_path}"\' >> ~/.bashrc')
         print("\nThen run experiments:")
         print("  cd tinyml")
         print("  python run_rebuttal_experiments.py --experiments ternary,synthesis,multi_scale")
