@@ -316,6 +316,8 @@ def run_ternary_baseline_comparison(args):
     
     # Training function with comprehensive error analysis
     def train_and_evaluate(model, name, train_loader, val_loader, test_loader, num_epochs=20, class_weights=None):
+        from sklearn.metrics import confusion_matrix, balanced_accuracy_score
+        
         print(f"\n[{name}]")
         
         # Setup optimizer with learning rate scheduling
