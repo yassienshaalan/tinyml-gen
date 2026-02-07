@@ -17,6 +17,7 @@ import torch
 import numpy as np
 import datetime
 import subprocess
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score
 
 
 class TeeLogger:
