@@ -1174,7 +1174,26 @@ def run_kws_perclass_analysis(args):
     num_classes = meta['num_classes']
     class_names = meta.get('class_names', [f"Class_{i}" for i in range(num_classes)])
     
-    print(f"\nClasses ({num_classes}): {', '.join(class_names)}")
+    print(f"\nDataset Info:")
+    print(f"  Classes: {num_classes}")
+    print(f"  Class names: {class_names}")
+    print(f"  Test samples: {len(test_loader.dataset)}")
+    
+    # Debug: Check test label distribution
+    test_labels_check = []
+    for _, y in test_loader:
+        test_labels_check.extend(y.numpy())
+    test_labels_check = np.array(test_labels_check)
+    unique_labels = np.unique(test_labels_check)
+    print(f"  Unique test labels: {unique_labels}")
+    print(f"  Label distribution: {[f'{i}:{(test_labels_check==i).sum()}' for i in unique_labels]}")
+    
+    if len(unique_labels) < num_classes:
+        print(f"\n⚠ WARNING: Test set only has {len(unique_labels)} classes, expected {num_classes}!")
+        print("This suggests the dataset is being loaded incorrectly or test set is too small.")
+        print("Continuing with analysis on available classes...")
+    
+    print(f"\nClasses to analyze: {', '.join(class_names)}")
     
     # Rebuild model
     model = safe_build_model('sharedcoreseparable1d', in_ch=meta['num_channels'], num_classes=num_classes, base=16, latent_dim=16)
