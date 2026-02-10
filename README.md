@@ -134,6 +134,12 @@ pip install -r requirements.txt
 ```bash
 cd tinyml
 python test_rebuttal_modules.py
+
+# Or run comprehensive unit tests
+python test_experiments.py
+
+# Or run quick VM tests (fastest)
+python ../scripts/quick_test.py
 ```
 
 **Expected Output**:
@@ -142,6 +148,53 @@ python test_rebuttal_modules.py
 [OK] Models can be instantiated
 [OK] Ready to run experiments
 ```
+
+---
+
+## Running Tests
+
+### Quick VM Tests (Recommended First)
+
+Fast validation without training - tests all code paths in under 30 seconds:
+
+```bash
+# Option 1: Python script (works on Windows/Linux)
+cd scripts
+python quick_test.py
+
+# Option 2: Bash script (Linux/Mac)
+./test_vm.sh
+```
+
+**Tests performed**:
+1. Module imports
+2. Model instantiation and forward/backward pass
+3. Ternary quantization
+4. Synthesis profiling
+5. Data generation
+6. Experiment configuration
+
+### Comprehensive Unit Tests
+
+Full test suite covering all functionality:
+
+```bash
+cd tinyml
+
+# Run all tests
+python test_experiments.py
+
+# Run only quick tests
+python test_experiments.py --quick
+```
+
+**Test coverage**:
+- Module imports (6 modules)
+- Model architectures (HyperTinyPW, ternary)
+- Data loading (synthetic, real datasets)
+- Experiment framework (training, evaluation)
+- Synthesis profiling
+- Utility functions
 
 ---
 
@@ -157,7 +210,6 @@ python run_experiments.py --experiments all
 ```
 
 **Runs**: keyword_spotting, ternary, multi_scale, synthesis, 8bit, kws_perclass  
-**Duration**: 10-60 minutes (depends on dataset availability)  
 **Output**: `results/` directory with JSON files + logs
 
 ### Option 2: Run Specific Experiments
@@ -176,20 +228,30 @@ python run_experiments.py --experiments all --epochs 30
 ### Option 3: Quick Test (No Data Download)
 
 ```bash
-# Uses synthetic data fallback (2-5 min)
+# Uses synthetic data fallback
 python run_experiments.py --experiments synthesis,ternary
+```
+
+### Option 4: Run Unit Tests
+
+```bash
+# Test all code paths and modules
+python test_experiments.py
+
+# Quick VM tests (fast, no training)
+python test_experiments.py --quick
 ```
 
 ### Available Experiments
 
-| Experiment | Flag | Duration | Data | Purpose |
-|------------|------|----------|------|---------|
-| **Keyword Spotting** | `keyword_spotting` | 30-60 min | Speech Commands | Cross-domain validation |
-| **Ternary Comparison** | `ternary` | 5-10 min | ECG | Quantization trade-off |
-| **8-bit Quantization** | `8bit` | 5-10 min | ECG | INT8 baseline |
-| **Multi-Scale** | `multi_scale` | 5-10 min | ECG | Scalability (100K-500K) |
-| **Synthesis Profiling** | `synthesis` | 2-5 min | Synthetic | Boot-time overhead |
-| **KWS Per-Class** | `kws_perclass` | 30-60 min | Speech | Class balance analysis |
+| Experiment | Flag | Data | Purpose |
+|------------|------|------|---------|
+| **Keyword Spotting** | `keyword_spotting` | Speech Commands | Cross-domain validation |
+| **Ternary Comparison** | `ternary` | ECG | Quantization trade-off |
+| **8-bit Quantization** | `8bit` | ECG | INT8 baseline |
+| **Multi-Scale** | `multi_scale` | ECG | Scalability (100K-500K) |
+| **Synthesis Profiling** | `synthesis` | Synthetic | Boot-time overhead |
+| **KWS Per-Class** | `kws_perclass` | Speech | Class balance analysis |
 
 **Special Flags**:
 - `all` - Run all experiments
@@ -395,6 +457,66 @@ tail -f tinyml/results/experiment_full.log
 ```bash
 chmod +x scripts/*.sh
 ```
+
+---
+
+## Quick Tests for Your VM
+
+Here are actual fast tests you can run on your VM to validate everything works:
+
+### Test 1: Quick Python Test (30 seconds)
+
+```bash
+cd scripts
+python quick_test.py
+```
+
+This tests:
+- All module imports
+- Model creation and forward/backward pass
+- Quantization
+- Profiling
+- Data generation
+
+### Test 2: Individual Component Tests
+
+```bash
+cd tinyml
+
+# Test model instantiation
+python -c "from models import HyperTinyPW; import torch; m = HyperTinyPW(2,1,8,2,32,100); print('Model OK')"
+
+# Test quantization
+python -c "from ternary_baseline import TernaryQuantizer; import torch; q = TernaryQuantizer(); print('Quantization OK')"
+
+# Test data generation
+python -c "from datasets import create_synthetic_ecg_data; X,y = create_synthetic_ecg_data(50, 100); print('Data OK')"
+```
+
+### Test 3: Run Synthesis Experiment (Fast)
+
+```bash
+cd tinyml
+python run_experiments.py --experiments synthesis
+```
+
+This runs the full synthesis profiling experiment with real model - takes about 1-2 minutes.
+
+### Test 4: Unit Tests
+
+```bash
+cd tinyml
+
+# Quick tests only (imports + basic functionality)
+python test_experiments.py --quick
+
+# All tests (comprehensive coverage)
+python test_experiments.py
+```
+
+### Expected Results
+
+All tests should show `[OK]` for each component. If you see `[FAIL]`, check the error message for missing dependencies or import issues.
 
 ---
 
