@@ -9,29 +9,29 @@ Accepted at **MLSys 2026** (Conference on Machine Learning and Systems)
 
 ---
 
-## 🎯 Quick Start
+## Quick Start
 
 ```bash
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Test your setup (30 seconds)
+# 2. Test your setup
 cd tinyml
 python test_rebuttal_modules.py
 
-# 3. Run all experiments (10-15 min with existing data)
-python run_rebuttal_experiments.py --experiments all
+# 3. Run all experiments
+python run_experiments.py --experiments all
 
 # 4. Check results
-ls rebuttal_results/
+ls results/
 ```
 
-**✅ All experiments log to files automatically!**  
-**✅ Results saved to `tinyml/rebuttal_results/` with JSON outputs and detailed logs**
+All experiments log to files automatically.  
+Results saved to `tinyml/results/` with JSON outputs and detailed logs.
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
 - [Overview](#overview)
 - [Repository Structure](#repository-structure)
@@ -44,11 +44,11 @@ ls rebuttal_results/
 
 ---
 
-## 🔬 Overview
+## Overview
 
 **HyperTinyPW** achieves **maximum compression while preserving accuracy** for TinyML models:
 
-- **12.5× compression ratio** (e.g., 903 KB → 72 KB)
+- **12.5x compression ratio** (e.g., 903 KB → 72 KB)
 - **Clinical-grade accuracy** (79.4% balanced accuracy on PTB-XL ECG)
 - **Optimal balance**: 72 KB vs. ternary's 6.7 KB with 24% accuracy loss
 - **Cross-domain**: Works on ECG, speech, and time-series data
@@ -60,17 +60,17 @@ HyperTinyPW uses a **lightweight generator** to synthesize full-precision weight
 
 | Method | Size | Balanced Accuracy | Status |
 |--------|------|-------------------|--------|
-| **Ternary (2-bit)** | 6.7 KB | 55.3% | ❌ Over-compressed |
-| **HyperTinyPW** | 72 KB | 79.4% | ✅ Optimally compressed |
-| **Full Precision** | 903 KB | 80.3% | ❌ Too large for MCU |
+| **Ternary (2-bit)** | 6.7 KB | 55.3% | Over-compressed |
+| **HyperTinyPW** | 72 KB | 79.4% | Optimally compressed |
+| **Full Precision** | 903 KB | 80.3% | Too large for MCU |
 
 ---
 
-## 📁 Repository Structure
+## Repository Structure
 
 ```
 tinyml-gen/
-├── tinyml/                          # 📦 Main source code
+├── tinyml/                          # Main source code
 │   ├── models.py                    # HyperTinyPW architecture
 │   ├── experiments.py               # Experiment framework
 │   ├── datasets.py                  # ECG dataset loaders
@@ -78,17 +78,17 @@ tinyml-gen/
 │   ├── ternary_baseline.py          # Ternary quantization
 │   ├── synthesis_profiler.py        # Boot-time profiling
 │   ├── speech_dataset.py            # Audio dataset (KWS)
-│   ├── run_rebuttal_experiments.py  # 🚀 Main runner
+│   ├── run_experiments.py           # Main experiment runner
 │   ├── test_rebuttal_modules.py     # Setup verification
 │   └── main.py                      # Original experiments
 │
-├── scripts/                         # 🛠 Utility scripts
+├── scripts/                         # Utility scripts
 │   ├── download_data.sh             # Download datasets
 │   ├── run_all_experiments.sh       # Full pipeline
 │   ├── download_ecg_data.py         # ECG downloader
 │   └── fix_dependencies.sh          # Dependency fixer
 │
-├── docs/                            # 📚 Documentation
+├── docs/                            # Documentation
 │   ├── COMPLETE_EXPERIMENTAL_REPORT.md  # Technical report
 │   ├── REBUTTAL_GUIDE.md                # Experiment guide
 │   ├── COMPLETE_REBUTTAL_GUIDE.md       # Full guide
@@ -101,7 +101,7 @@ tinyml-gen/
 
 ---
 
-## 🛠 Installation
+## Installation
 
 ### Prerequisites
 
@@ -138,46 +138,46 @@ python test_rebuttal_modules.py
 
 **Expected Output**:
 ```
-✅ All rebuttal modules imported successfully!
-✅ Models can be instantiated
-✅ Ready to run experiments
+[OK] All modules imported successfully!
+[OK] Models can be instantiated
+[OK] Ready to run experiments
 ```
 
 ---
 
-## 🚀 Running Experiments
+## Running Experiments
 
-All experiments are consolidated in **one file**: `tinyml/run_rebuttal_experiments.py`
+All experiments are consolidated in **one file**: `tinyml/run_experiments.py`
 
 ### Option 1: Run All Experiments
 
 ```bash
 cd tinyml
-python run_rebuttal_experiments.py --experiments all
+python run_experiments.py --experiments all
 ```
 
-**Runs**: keyword_spotting, ternary, multi_scale, synthesis  
+**Runs**: keyword_spotting, ternary, multi_scale, synthesis, 8bit, kws_perclass  
 **Duration**: 10-60 minutes (depends on dataset availability)  
-**Output**: `rebuttal_results/` directory with JSON files + logs
+**Output**: `results/` directory with JSON files + logs
 
 ### Option 2: Run Specific Experiments
 
 ```bash
 # Single experiment
-python run_rebuttal_experiments.py --experiments ternary
+python run_experiments.py --experiments ternary
 
 # Multiple experiments (any combination)
-python run_rebuttal_experiments.py --experiments ternary,multi_scale,synthesis
+python run_experiments.py --experiments ternary,multi_scale,synthesis
 
 # Custom epochs
-python run_rebuttal_experiments.py --experiments all --epochs 30
+python run_experiments.py --experiments all --epochs 30
 ```
 
 ### Option 3: Quick Test (No Data Download)
 
 ```bash
 # Uses synthetic data fallback (2-5 min)
-python run_rebuttal_experiments.py --experiments synthesis,ternary
+python run_experiments.py --experiments synthesis,ternary
 ```
 
 ### Available Experiments
@@ -186,13 +186,15 @@ python run_rebuttal_experiments.py --experiments synthesis,ternary
 |------------|------|----------|------|---------|
 | **Keyword Spotting** | `keyword_spotting` | 30-60 min | Speech Commands | Cross-domain validation |
 | **Ternary Comparison** | `ternary` | 5-10 min | ECG | Quantization trade-off |
+| **8-bit Quantization** | `8bit` | 5-10 min | ECG | INT8 baseline |
 | **Multi-Scale** | `multi_scale` | 5-10 min | ECG | Scalability (100K-500K) |
 | **Synthesis Profiling** | `synthesis` | 2-5 min | Synthetic | Boot-time overhead |
+| **KWS Per-Class** | `kws_perclass` | 30-60 min | Speech | Class balance analysis |
 
 **Special Flags**:
-- `all` - Run all four experiments
+- `all` - Run all experiments
 - `--epochs N` - Training epochs (default: 20)
-- `--batch-size N` - Batch size (default: 32)
+- `--batch-size N` - Batch size (default: 32/64)
 
 ### Using Complete Pipeline Script
 
@@ -203,14 +205,14 @@ cd scripts
 ```
 
 This script:
-1. ✅ Tests setup
-2. ✅ Runs all experiments
-3. ✅ Generates summary
-4. ✅ Shows results
+1. Tests setup
+2. Runs all experiments
+3. Generates summary
+4. Shows results
 
 ---
 
-## 📊 Experiment Details
+## Experiment Details
 
 ### 1. Keyword Spotting (Cross-Domain)
 
@@ -225,7 +227,7 @@ cd scripts
 
 # Run experiment
 cd ../tinyml
-python run_rebuttal_experiments.py --experiments keyword_spotting
+python run_experiments.py --experiments keyword_spotting
 ```
 
 **Expected Results**:
@@ -243,13 +245,13 @@ python run_rebuttal_experiments.py --experiments keyword_spotting
 
 ```bash
 cd tinyml
-python run_rebuttal_experiments.py --experiments ternary
+python run_experiments.py --experiments ternary
 ```
 
 **Results**:
 - **HyperTinyPW**: 72 KB, 79.4% balanced accuracy
 - **Ternary (2-bit)**: 6.7 KB, 55.3% balanced accuracy
-- **Trade-off**: 10.8× smaller but 24% accuracy loss
+- **Trade-off**: 10.8x smaller but 24% accuracy loss
 
 **Key Finding**: Ternary over-compresses (unusable), HyperTinyPW optimally compresses
 
@@ -263,7 +265,7 @@ python run_rebuttal_experiments.py --experiments ternary
 
 ```bash
 cd tinyml
-python run_rebuttal_experiments.py --experiments multi_scale
+python run_experiments.py --experiments multi_scale
 ```
 
 **Configurations**:
@@ -271,7 +273,7 @@ python run_rebuttal_experiments.py --experiments multi_scale
 - **Medium**: 347K params → 109 KB (80% accuracy)
 - **Large**: 489K params → 153 KB (85% accuracy)
 
-**Key Finding**: Stable 12.5× compression + 80-85% accuracy across scales
+**Key Finding**: Stable 12.5x compression + 80-85% accuracy across scales
 
 ---
 
@@ -282,7 +284,7 @@ python run_rebuttal_experiments.py --experiments multi_scale
 
 ```bash
 cd tinyml
-python run_rebuttal_experiments.py --experiments synthesis
+python run_experiments.py --experiments synthesis
 ```
 
 **Expected Results**:
@@ -292,20 +294,22 @@ python run_rebuttal_experiments.py --experiments synthesis
 
 ---
 
-## 📈 Results & Outputs
+## Results & Outputs
 
 ### Output Structure
 
-All results saved to `tinyml/rebuttal_results/`:
+All results saved to `tinyml/results/`:
 
 ```
-rebuttal_results/
+results/
 ├── keyword_spotting_results.json      # Audio validation
 ├── ternary_comparison.json            # Accuracy vs. size
 ├── multi_scale_validation.json        # Scalability
 ├── synthesis_profile.json             # Profiling
+├── 8bit_quantization_ptbxl.json       # INT8 baseline
+├── kws_perclass_analysis.json         # Per-class analysis
 ├── experiment_full.log                # Combined log
-└── rebuttal_summary.json              # Summary
+└── experiment_summary.json            # Summary
 ```
 
 ### Example Output (`ternary_comparison.json`)
@@ -336,21 +340,21 @@ rebuttal_results/
 |--------|-------------|---------|----------------|
 | **PTB-XL Accuracy** | 79.4% | 55.3% | 80.3% |
 | **Compressed Size** | 72 KB | 6.7 KB | 903 KB |
-| **Compression** | 12.5× | 138× | 1× |
-| **MCU Feasible** | ✅ | ✅ | ❌ |
-| **Clinical Grade** | ✅ | ❌ | ✅ |
+| **Compression** | 12.5x | 138x | 1x |
+| **MCU Feasible** | Yes | Yes | No |
+| **Clinical Grade** | Yes | No | Yes |
 
 ---
 
-## 📖 Documentation
+## Documentation
 
-- **[docs/COMPLETE_EXPERIMENTAL_REPORT.md](docs/COMPLETE_EXPERIMENTAL_REPORT.md)** - Full technical report (50+ pages)
+- **[docs/COMPLETE_EXPERIMENTAL_REPORT.md](docs/COMPLETE_EXPERIMENTAL_REPORT.md)** - Full technical report
 - **[docs/REBUTTAL_GUIDE.md](docs/REBUTTAL_GUIDE.md)** - Step-by-step experiment guide
 - **[docs/SETUP_LINUX.md](docs/SETUP_LINUX.md)** - Linux-specific instructions
 
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 ### Common Issues
 
@@ -377,13 +381,13 @@ export APNEA_ROOT=/path/to/apnea
 ```bash
 # Force CPU (TinyML targets CPU anyway)
 export CUDA_VISIBLE_DEVICES=""
-python run_rebuttal_experiments.py --experiments all
+python run_experiments.py --experiments all
 ```
 
 #### 4. Check Logs
 
 ```bash
-tail -f tinyml/rebuttal_results/experiment_full.log
+tail -f tinyml/results/experiment_full.log
 ```
 
 #### 5. Permission Errors (Linux)
@@ -394,7 +398,7 @@ chmod +x scripts/*.sh
 
 ---
 
-## 🎓 Citation
+## Citation
 
 ```bibtex
 @inproceedings{shaalan2026hypertinypw,
@@ -407,13 +411,13 @@ chmod +x scripts/*.sh
 
 ---
 
-## 📄 License
+## License
 
 MIT License - see [LICENSE](LICENSE)
 
 ---
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - **PTB-XL**: Wagner et al., Scientific Data, 2020
 - **Apnea-ECG**: Penzel et al., Computers in Cardiology, 2000
@@ -422,12 +426,12 @@ MIT License - see [LICENSE](LICENSE)
 
 ---
 
-## 📧 Contact
+## Contact
 
 - **GitHub**: https://github.com/yassienshaalan/tinyml-gen
 - **Conference**: MLSys 2026
 
 ---
 
-**Last Updated**: February 10, 2026  
-**Version**: 2.0 (Reorganized - All experiments consolidated)
+**Last Updated**: February 11, 2026  
+**Version**: 2.1 (Consolidated - All experiments in one file)

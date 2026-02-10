@@ -1,10 +1,13 @@
 """
-Rebuttal Experiments Runner
-Runs all new experiments mentioned in the rebuttal:
+HyperTinyPW Experiments Runner
+Comprehensive experiments for the paper:
 1. Non-ECG benchmark (keyword spotting)
 2. Ternary quantization baseline comparison
-3. Boot-time synthesis profiling
-4. NAS compatibility demonstration
+3. 8-bit quantization baseline
+4. Multi-scale validation
+5. Boot-time synthesis profiling
+6. NAS compatibility demonstration
+7. Per-class analysis
 
 All results are logged to files in the output directory.
 """
@@ -1287,7 +1290,7 @@ def run_kws_perclass_analysis(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Run ALL rebuttal experiments for HyperTinyPW paper'
+        description='Run all experiments for HyperTinyPW paper'
     )
     
     parser.add_argument(
@@ -1299,7 +1302,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=64, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs')
     parser.add_argument('--cpu', action='store_true', help='Force CPU (disable CUDA)')
-    parser.add_argument('--output-dir', type=str, default='./rebuttal_results',
+    parser.add_argument('--output-dir', type=str, default='./results',
                        help='Output directory for results')
     
     args = parser.parse_args()
@@ -1322,7 +1325,7 @@ def main():
     git_commit = get_git_commit()
     
     print("=" * 80)
-    print("HYPERTINYPW REBUTTAL EXPERIMENTS - ALL IN ONE")
+    print("HYPERTINYPW EXPERIMENTS")
     print("=" * 80)
     print(f"\n[VERSION INFO]")
     print(f"Git commit: {git_commit}")
@@ -1397,7 +1400,7 @@ def main():
             traceback.print_exc()
     
     # Save summary
-    summary_path = Path(args.output_dir) / 'rebuttal_summary.json'
+    summary_path = Path(args.output_dir) / 'experiment_summary.json'
     with open(summary_path, 'w') as f:
         json.dump(all_results, f, indent=2, default=str)
     
@@ -1412,9 +1415,9 @@ def main():
     print("\nQuick Summary:")
     for exp_name, result in all_results.items():
         if result is not None:
-            print(f"  ✓ {exp_name}: Complete")
+            print(f"  [OK] {exp_name}: Complete")
         else:
-            print(f"  WARNING: {exp_name}: Skipped or failed")
+            print(f"  [WARNING] {exp_name}: Skipped or failed")
     
     # Close logger
     logger.close()
