@@ -82,7 +82,7 @@ def download_dataset(dataset_name, gcs_path, local_path, check_file):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Download ECG datasets from GCP bucket for rebuttal experiments'
+        description='Download ECG datasets from GCS bucket for experiments'
     )
     parser.add_argument(
         '--dataset',
@@ -171,7 +171,7 @@ def main():
             print(f'echo \'export {env_var}="{local_path}"\' >> ~/.bashrc')
         print("\nThen run experiments:")
         print("  cd tinyml")
-        print("  python run_rebuttal_experiments.py --experiments ternary,synthesis,multi_scale")
+        print("  python run_experiments.py --experiments ternary,synthesis,multi_scale")
 
 
 if __name__ == '__main__':

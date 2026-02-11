@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Data Download Script for TinyML Experiments
-Downloads datasets for rebuttal and original experiments.
+Downloads datasets for experiments.
 
 Usage:
   python download_data.py --datasets all              # Download all datasets
   python download_data.py --datasets speech           # Only Speech Commands
   python download_data.py --datasets speech,apnea     # Multiple specific datasets
-  python download_data.py --rebuttal-only             # Only datasets needed for rebuttal experiments
+  python download_data.py --minimal                   # Only datasets needed for minimal experiments
 """
 
 import os
@@ -79,7 +79,7 @@ def extract_zip(filepath, output_dir):
 def download_speech_commands(data_dir):
     """
     Download Google Speech Commands v0.02 dataset
-    Required for: Keyword Spotting experiment (rebuttal)
+    Required for: Keyword Spotting experiment (cross-domain validation)
     Size: ~2GB
     """
     print("\n" + "=" * 70)
@@ -227,8 +227,8 @@ Examples:
   # Download all datasets
   python download_data.py --datasets all
   
-  # Download only datasets needed for rebuttal experiments
-  python download_data.py --rebuttal-only
+  # Download only datasets needed for minimal experiments
+  python download_data.py --minimal
   
   # Download specific datasets
   python download_data.py --datasets speech
@@ -252,9 +252,9 @@ Available datasets:
         help='Comma-separated list of datasets to download: speech,apnea,ptbxl,mitdb,all'
     )
     parser.add_argument(
-        '--rebuttal-only',
+        '--minimal',
         action='store_true',
-        help='Download only datasets required for rebuttal experiments (speech commands)'
+        help='Download only datasets required for minimal experiments (speech commands)'
     )
     parser.add_argument(
         '--data-dir',
@@ -272,9 +272,9 @@ Available datasets:
     args = parser.parse_args()
     
     # Validate arguments
-    if not args.datasets and not args.rebuttal_only:
+    if not args.datasets and not args.minimal:
         parser.print_help()
-        print("\n✗ Error: Must specify either --datasets or --rebuttal-only")
+        print("\\n[ERROR] Must specify either --datasets or --minimal")
         sys.exit(1)
     
     # Setup data directory
@@ -287,10 +287,10 @@ Available datasets:
     print(f"\nData directory: {data_dir}")
     
     # Determine which datasets to download
-    if args.rebuttal_only:
+    if args.minimal:
         datasets = ['speech']
-        print("\nMode: REBUTTAL ONLY")
-        print("  Downloading only datasets required for rebuttal experiments")
+        print("\\nMode: MINIMAL")
+        print("  Downloading only datasets required for minimal experiments")
     else:
         if args.datasets.lower() == 'all':
             datasets = ['speech', 'apnea', 'ptbxl', 'mitdb']
@@ -315,7 +315,7 @@ Available datasets:
         results['mitdb'] = download_mitdb(data_dir)
     
     # Synthetic data info
-    if args.rebuttal_only or 'all' in args.datasets.lower():
+    if args.minimal or 'all' in args.datasets.lower():
         create_synthetic_data(data_dir)
     
     # Summary
@@ -339,15 +339,15 @@ Available datasets:
         print("   # Add to ~/.bashrc for persistence")
         print(f"   echo 'export SPEECH_COMMANDS_ROOT={speech_dir}' >> ~/.bashrc")
     
-    print("\n2. Run rebuttal experiments:")
+    print("\n2. Run experiments:")
     print("   cd tinyml")
-    print("   python test_rebuttal_modules.py                    # Test setup")
-    print("   python run_rebuttal_experiments.py --experiments all --epochs 20")
+    print("   python test_experiments.py                     # Test setup")
+    print("   python run_experiments.py --experiments all --epochs 20")
     
     print("\n3. Check results:")
-    print("   ls -lh tinyml/rebuttal_results/")
+    print("   ls -lh tinyml/results/")
     
-    if args.rebuttal_only:
+    if args.minimal:
         print("\n" + "=" * 70)
         print("REBUTTAL EXPERIMENTS DATA REQUIREMENTS")
         print("=" * 70)

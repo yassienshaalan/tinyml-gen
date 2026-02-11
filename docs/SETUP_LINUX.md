@@ -1,6 +1,6 @@
 # Setup Guide for Linux Machine
 
-Complete setup instructions for running rebuttal experiments on a fresh Linux machine.
+Complete setup instructions for running experiments on a fresh Linux machine.
 
 ## 1. System Requirements
 
@@ -66,15 +66,15 @@ bash fix_dependencies.sh
 
 ## 3. Download Data
 
-### Option A: Download Only Rebuttal Data (Recommended)
+### Option A: Download Only Minimal Data (Recommended)
 Downloads only Speech Commands dataset (~2GB) needed for keyword spotting.
 
 ```bash
 # Make download script executable
 chmod +x download_data.py
 
-# Download rebuttal-only datasets
-python3 download_data.py --rebuttal-only
+# Download minimal datasets
+python3 download_data.py --minimal
 ```
 
 **What this downloads:**
@@ -122,7 +122,7 @@ ls $SPEECH_COMMANDS_ROOT  # Should show directories: yes, no, up, down, etc.
 
 ```bash
 cd tinyml
-python3 test_rebuttal_modules.py
+python3 test_experiments.py
 ```
 
 **Expected output:**
@@ -135,46 +135,46 @@ Testing nas_compatibility module...
 All tests passed! Ready to run experiments.
 ```
 
-## 6. Run Rebuttal Experiments
+## 6. Run Experiments
 
 ### Quick Run (Without Keyword Spotting, 5-10 min)
 For fast testing without downloading data:
 
 ```bash
-python3 run_rebuttal_experiments.py --experiments ternary,synthesis,nas
+python3 run_experiments.py --experiments ternary,synthesis,nas
 ```
 
 ### Full Run (All 4 Experiments, ~60 min)
 Includes keyword spotting with Speech Commands:
 
 ```bash
-python3 run_rebuttal_experiments.py --experiments all --epochs 20
+python3 run_experiments.py --experiments all --epochs 20
 ```
 
 ### Custom Options
 ```bash
 # Smaller batch size for limited RAM
-python3 run_rebuttal_experiments.py --experiments all --batch-size 32 --epochs 10
+python3 run_experiments.py --experiments all --batch-size 32 --epochs 10
 
 # Force CPU (if no GPU)
-python3 run_rebuttal_experiments.py --experiments all --cpu
+python3 run_experiments.py --experiments all --cpu
 
 # Custom output directory
-python3 run_rebuttal_experiments.py --experiments all --output-dir /path/to/results
+python3 run_experiments.py --experiments all --output-dir /path/to/results
 ```
 
 ## 7. Check Results
 
-All results are saved in `tinyml/rebuttal_results/`:
+All results are saved in `tinyml/results/`:
 
 ```bash
-cd tinyml/rebuttal_results
+cd tinyml/results
 
 # List all output files
 ls -lh
 
 # View summary
-cat rebuttal_summary.json
+cat experiment_summary.json
 
 # View specific results
 cat ternary_comparison.json
@@ -189,9 +189,9 @@ less experiment_full.log
 ## 8. Output Files Explained
 
 ```
-rebuttal_results/
+results/
 ├── experiment_full.log              # Complete console output
-├── rebuttal_summary.json            # Summary of all experiments
+├── experiment_summary.json          # Summary of all experiments
 ├── keyword_spotting_results.json    # Speech experiment results
 ├── keyword_spotting.log             # Speech training logs
 ├── ternary_comparison.json          # Quantization comparison
@@ -244,19 +244,19 @@ export SPEECH_COMMANDS_ROOT=$(pwd)/data/speech_commands_v0.02
 ls data/speech_commands_v0.02/
 
 # Re-download if needed
-python3 download_data.py --rebuttal-only
+python3 download_data.py --minimal
 ```
 
 ### Out of Memory
 ```bash
 # Use smaller batch size
-python3 run_rebuttal_experiments.py --experiments all --batch-size 16 --cpu
+python3 run_experiments.py --experiments all --batch-size 16 --cpu
 ```
 
 ### CUDA Errors
 ```bash
 # Force CPU mode
-python3 run_rebuttal_experiments.py --experiments all --cpu
+python3 run_experiments.py --experiments all --cpu
 ```
 
 ### Permission Denied on download_data.py
@@ -280,8 +280,8 @@ bash fix_dependencies.sh
 git clone https://github.com/yassienshaalan/tinyml-gen.git
 cd tinyml-gen
 
-# 3. Download rebuttal data
-python3 download_data.py --rebuttal-only
+# 3. Download minimal data
+python3 download_data.py --minimal
 
 # 4. Set environment variable
 export SPEECH_COMMANDS_ROOT=$(pwd)/data/speech_commands_v0.02
@@ -289,14 +289,14 @@ echo "export SPEECH_COMMANDS_ROOT=$(pwd)/data/speech_commands_v0.02" >> ~/.bashr
 
 # 5. Test setup
 cd tinyml
-python3 test_rebuttal_modules.py
+python3 test_experiments.py
 
-# 6. Run all rebuttal experiments
-python3 run_rebuttal_experiments.py --experiments all --epochs 20
+# 6. Run all experiments
+python3 run_experiments.py --experiments all --epochs 20
 
 # 7. Check results
-ls -lh rebuttal_results/
-cat rebuttal_results/rebuttal_summary.json
+ls -lh results/
+cat results/experiment_summary.json
 ```
 
 ## 12. Expected Timeline
@@ -317,18 +317,18 @@ Before running experiments, verify:
 - [ ] PyTorch installed: `python3 -c "import torch; print(torch.__version__)"`
 - [ ] Speech Commands downloaded: `ls data/speech_commands_v0.02/`
 - [ ] Environment variable set: `echo $SPEECH_COMMANDS_ROOT`
-- [ ] Tests pass: `python3 test_rebuttal_modules.py`
+- [ ] Tests pass: `python3 test_experiments.py`
 - [ ] In correct directory: `pwd` should end with `/tinyml`
 
 ## 14. Support
 
 If you encounter issues:
 
-1. Check `rebuttal_results/experiment_full.log` for detailed error messages
+1. Check `results/experiment_full.log` for detailed error messages
 2. Verify all dependencies: `pip3 list | grep torch`
 3. Check disk space: `df -h`
 4. Check memory: `free -h`
 
 For detailed documentation, see:
-- [REBUTTAL_GUIDE.md](REBUTTAL_GUIDE.md) - Complete experiment guide
+- [COMPLETE_EXPERIMENTAL_REPORT.md](COMPLETE_EXPERIMENTAL_REPORT.md) - Complete experiment guide
 - [README.md](README.md) - Project overview

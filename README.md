@@ -17,7 +17,7 @@ pip install -r requirements.txt
 
 # 2. Test your setup
 cd tinyml
-python test_rebuttal_modules.py
+python test_experiments.py
 
 # 3. Run all experiments
 python run_experiments.py --experiments all
@@ -79,7 +79,7 @@ tinyml-gen/
 │   ├── synthesis_profiler.py        # Boot-time profiling
 │   ├── speech_dataset.py            # Audio dataset (KWS)
 │   ├── run_experiments.py           # Main experiment runner
-│   ├── test_rebuttal_modules.py     # Setup verification
+│   ├── test_experiments.py          # Comprehensive unit tests
 │   └── main.py                      # Original experiments
 │
 ├── scripts/                         # Utility scripts
@@ -90,8 +90,6 @@ tinyml-gen/
 │
 ├── docs/                            # Documentation
 │   ├── COMPLETE_EXPERIMENTAL_REPORT.md  # Technical report
-│   ├── REBUTTAL_GUIDE.md                # Experiment guide
-│   ├── COMPLETE_REBUTTAL_GUIDE.md       # Full guide
 │   └── SETUP_LINUX.md                   # Linux setup
 │
 ├── requirements.txt                 # Python dependencies
@@ -133,9 +131,8 @@ pip install -r requirements.txt
 
 ```bash
 cd tinyml
-python test_rebuttal_modules.py
 
-# Or run comprehensive unit tests
+# Run comprehensive unit tests
 python test_experiments.py
 
 # Or run quick VM tests (fastest)
@@ -411,7 +408,6 @@ results/
 ## Documentation
 
 - **[docs/COMPLETE_EXPERIMENTAL_REPORT.md](docs/COMPLETE_EXPERIMENTAL_REPORT.md)** - Full technical report
-- **[docs/REBUTTAL_GUIDE.md](docs/REBUTTAL_GUIDE.md)** - Step-by-step experiment guide
 - **[docs/SETUP_LINUX.md](docs/SETUP_LINUX.md)** - Linux-specific instructions
 
 ---
