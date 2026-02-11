@@ -137,14 +137,14 @@ All tests passed! Ready to run experiments.
 
 ## 6. Run Experiments
 
-### Quick Run (Without Keyword Spotting, 5-10 min)
+### Quick Run (Without Keyword Spotting)
 For fast testing without downloading data:
 
 ```bash
 python3 run_experiments.py --experiments ternary,synthesis,nas
 ```
 
-### Full Run (All 4 Experiments, ~60 min)
+### Full Run (All 4 Experiments)
 Includes keyword spotting with Speech Commands:
 
 ```bash
@@ -201,12 +201,12 @@ results/
 
 ## 9. Data Requirements by Experiment
 
-| Experiment | Data Needed | Download? | Runtime |
+| Experiment | Data Needed | Download?  |
 |------------|-------------|-----------|---------|
-| Ternary Baseline | Existing ECG or synthetic | NO | 1 min |
-| Synthesis Profiling | Synthetic | NO | 2-5 min |
-| NAS Compatibility | Synthetic | NO | 2 min |
-| Keyword Spotting | Speech Commands v0.02 | YES (~2GB) | 30-60 min |
+| Ternary Baseline | Existing ECG or synthetic | NO  |
+| Synthesis Profiling | Synthetic | NO  |
+| NAS Compatibility | Synthetic | NO |
+| Keyword Spotting | Speech Commands v0.02 | YES (~2GB) |
 
 ## 10. Troubleshooting
 
@@ -330,5 +330,4 @@ If you encounter issues:
 4. Check memory: `free -h`
 
 For detailed documentation, see:
-- [COMPLETE_EXPERIMENTAL_REPORT.md](COMPLETE_EXPERIMENTAL_REPORT.md) - Complete experiment guide
 - [README.md](README.md) - Project overview
