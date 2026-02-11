@@ -14,7 +14,7 @@ cd "$(dirname "$0")/../tinyml"
 
 # Test setup
 echo "[1/5] Testing setup..."
-python test_rebuttal_modules.py
+python test_experiments.py
 echo "[OK] Setup verified"
 echo ""
 
