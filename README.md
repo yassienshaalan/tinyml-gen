@@ -96,7 +96,7 @@ tinyml-gen/
 ├── README.md                        # This file
 └── LICENSE                          # MIT License
 ```
-
+[Data on GCP Bucket](https://console.cloud.google.com/storage/browser/hypertinypw)
 ---
 
 ## Installation
