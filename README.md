@@ -521,8 +521,8 @@ All tests should show `[OK]` for each component. If you see `[FAIL]`, check the 
 ```bibtex
 @inproceedings{shaalan2026hypertinypw,
   title={Once-for-All Channel Mixers (HYPERTINYPW): Generative Compression for TinyML},
-  author={Shaalan, Yassien and [Co-authors]},
-  booktitle={Proceedings of MLSys},
+  author={Shaalan, Yassien },
+  booktitle={Proceedings of MLSys26},
   year={2026}
 }
 ```
@@ -531,7 +531,7 @@ All tests should show `[OK]` for each component. If you see `[FAIL]`, check the 
 
 ## License
 
-MIT License - see [LICENSE](LICENSE)
+Apache License - see [LICENSE](LICENSE)
 
 ---
 
@@ -540,7 +540,6 @@ MIT License - see [LICENSE](LICENSE)
 - **PTB-XL**: Wagner et al., Scientific Data, 2020
 - **Apnea-ECG**: Penzel et al., Computers in Cardiology, 2000
 - **Speech Commands**: Warden, 2018
-- **MLSys Community**: For valuable feedback
 
 ---
 
@@ -548,8 +547,3 @@ MIT License - see [LICENSE](LICENSE)
 
 - **GitHub**: https://github.com/yassienshaalan/tinyml-gen
 - **Conference**: MLSys 2026
-
----
-
-**Last Updated**: February 11, 2026  
-**Version**: 2.1 (Consolidated - All experiments in one file)
