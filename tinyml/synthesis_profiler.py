@@ -30,7 +30,8 @@ class SynthesisProfiler:
     Profile boot-time synthesis and steady-state inference separately.
     Provides detailed metrics for deployment-critical analysis.
     """
-    def __init__(self, device='cuda', warmup=5, repeats=20):
+    def __init__(self, model=None, device='cuda', warmup=5, repeats=20):
+        self.model = model
         self.device = device
         self.warmup = warmup
         self.repeats = repeats
@@ -43,6 +44,34 @@ class SynthesisProfiler:
         self.SRAM_READ_ENERGY_NJ = 0.1  # per byte
         self.FLASH_READ_ENERGY_NJ = 0.05  # per byte
         
+    def profile_inference(self, input_tensor, n_runs=20):
+        """
+        Profile end-to-end inference time for the stored model.
+
+        Args:
+            input_tensor: Example input tensor
+            n_runs: Number of timed runs (after warmup)
+
+        Returns:
+            Average inference time in seconds.
+        """
+        if self.model is None:
+            raise RuntimeError("No model set. Pass a model to SynthesisProfiler().")
+        self.model.eval()
+        self.model.to(self.device)
+        input_tensor = input_tensor.to(self.device)
+
+        with torch.no_grad():
+            for _ in range(self.warmup):
+                _ = self.model(input_tensor)
+
+            start = time.perf_counter()
+            for _ in range(n_runs):
+                _ = self.model(input_tensor)
+            elapsed = time.perf_counter() - start
+
+        return elapsed / n_runs
+
     def profile_synthesis(self, generator_fn, weight_shape, layer_name="layer"):
         """
         Profile a weight synthesis operation.
