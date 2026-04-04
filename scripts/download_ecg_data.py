@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 Download ECG datasets from GCP bucket to local data folder.
-This allows running experiments on real data instead of synthetic data.
+Supports two backends:
+  1. gsutil  (Google Cloud SDK)   — fastest for large syncs
+  2. gcsfs   (pip install gcsfs)  — pure-Python fallback
 
 Usage:
     python download_ecg_data.py --dataset apnea          # Download Apnea ECG only
-    python download_ecg_data.py --dataset all            # Download all datasets
-    python download_ecg_data.py --target-dir ./data      # Custom target directory
+    python download_ecg_data.py --dataset all             # Download all datasets
+    python download_ecg_data.py --target-dir ./data       # Custom target directory
 """
 import os
 import sys
@@ -14,26 +16,35 @@ import argparse
 import subprocess
 from pathlib import Path
 
-# GCP bucket paths (from your data_loaders.py)
+# ── GCP bucket layout ──────────────────────────────────────────────────────────
 GCP_BASE = "gs://store-pepper/tinyml_hyper_tiny_baselines/data"
+
+# Maps dataset key → (GCS path, *local subdir*, check file).
+# Local subdirs now match what data_loaders.py expects by default.
 DATASETS = {
     'apnea': {
         'gcs': f"{GCP_BASE}/apnea-ecg-database-1.0.0",
-        'check_file': 'a01.dat',  # File that should exist if downloaded
+        'local_dir': 'apnea-ecg-database-1.0.0',
+        'check_file': 'a01.dat',
+        'env_var': 'APNEA_ROOT',
     },
     'ptbxl': {
         'gcs': f"{GCP_BASE}/ptbxl",
-        'check_file': 'raw/ptbxl_database.csv',
+        'local_dir': 'ptbxl',
+        'check_file': 'ptbxl_database.csv',
+        'env_var': 'PTBXL_ROOT',
     },
     'mitbih': {
         'gcs': f"{GCP_BASE}/mitbih/raw",
+        'local_dir': 'mitbih/raw',
         'check_file': '100.dat',
+        'env_var': 'MITDB_ROOT',
     },
 }
 
 
-def check_gsutil():
-    """Check if gsutil is installed"""
+# ── Backend helpers ────────────────────────────────────────────────────────────
+def _has_gsutil():
     try:
         subprocess.run(['gsutil', '--version'], capture_output=True, check=True)
         return True
@@ -41,137 +52,138 @@ def check_gsutil():
         return False
 
 
-def is_already_downloaded(local_path, check_file):
-    """Check if dataset already exists locally"""
-    check_path = Path(local_path) / check_file
-    exists = check_path.exists()
-    if exists:
-        print(f"  ✓ Already downloaded: {check_path} exists")
-    return exists
-
-
-def download_dataset(dataset_name, gcs_path, local_path, check_file):
-    """Download dataset from GCS to local path"""
-    local_path = Path(local_path)
-    
-    # Check if already downloaded
-    if is_already_downloaded(local_path, check_file):
-        print(f"  → Skipping {dataset_name} (already downloaded)")
-        return 'skipped'
-    
-    local_path.mkdir(parents=True, exist_ok=True)
-    local_path.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\n{'='*80}")
-    print(f"Downloading {dataset_name}")
-    print(f"  From: {gcs_path}")
-    print(f"  To:   {local_path}")
-    print(f"{'='*80}\n")
-    
-    # Use gsutil to sync (only downloads new/changed files)
-    cmd = ['gsutil', '-m', 'rsync', '-r', gcs_path, str(local_path)]
-    
+def _has_gcsfs():
     try:
-        result = subprocess.run(cmd, check=True)
-        print(f"\n✓ {dataset_name} downloaded successfully to {local_path}")
+        import gcsfs  # noqa: F401
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"\n✗ Failed to download {dataset_name}: {e}")
+    except ImportError:
         return False
 
 
+def _download_gsutil(gcs_path, local_path):
+    """Download via gsutil -m rsync (parallel, resumable)."""
+    cmd = ['gsutil', '-m', 'rsync', '-r', gcs_path, str(local_path)]
+    subprocess.run(cmd, check=True)
+
+
+def _download_gcsfs(gcs_path, local_path):
+    """Download via gcsfs (pure-Python, no Cloud SDK needed)."""
+    import gcsfs
+    fs = gcsfs.GCSFileSystem()
+    # Strip gs:// for gcsfs
+    bucket_path = gcs_path.replace("gs://", "")
+    remote_files = fs.find(bucket_path)
+    total = len(remote_files)
+    print(f"  Found {total} files to download")
+    for i, rpath in enumerate(remote_files, 1):
+        rel = rpath[len(bucket_path):].lstrip("/")
+        dst = local_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() and dst.stat().st_size > 0:
+            continue
+        fs.get(rpath, str(dst))
+        if i % 50 == 0 or i == total:
+            print(f"  [{i}/{total}] downloaded")
+
+
+def download_dataset(ds_name, ds_info, data_root, *, backend, force=False):
+    """Download a single dataset, returns True/False/'skipped'."""
+    local_path = data_root / ds_info['local_dir']
+    check = local_path / ds_info['check_file']
+
+    if not force and check.exists():
+        print(f"  [{ds_name}] Already present ({check}), skipping.")
+        return 'skipped'
+
+    local_path.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'=' * 70}")
+    print(f"  Downloading {ds_name}")
+    print(f"    From: {ds_info['gcs']}")
+    print(f"    To:   {local_path}")
+    print(f"    Via:  {backend}")
+    print(f"{'=' * 70}")
+
+    try:
+        if backend == 'gsutil':
+            _download_gsutil(ds_info['gcs'], local_path)
+        else:
+            _download_gcsfs(ds_info['gcs'], local_path)
+        print(f"  [{ds_name}] Download complete.")
+        return True
+    except Exception as e:
+        print(f"  [{ds_name}] Download FAILED: {e}")
+        return False
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description='Download ECG datasets from GCS bucket for experiments'
+        description='Download ECG datasets from GCS bucket for experiments',
     )
     parser.add_argument(
-        '--dataset',
-        type=str,
-        default='all',
+        '--dataset', type=str, default='all',
         choices=['apnea', 'ptbxl', 'mitbih', 'all'],
-        help='Which dataset to download (default: all)'
+        help='Which dataset to download (default: all)',
     )
     parser.add_argument(
-        '--target-dir',
-        type=str,
-        default='./data',
-        help='Local directory to download to (default: ./data)'
+        '--target-dir', type=str, default='./data',
+        help='Local directory to download into (default: ./data)',
     )
     parser.add_argument(
-        '--force',
-        action='store_true',
-        help='Force re-download even if data exists'
+        '--force', action='store_true',
+        help='Force re-download even if data exists',
     )
-    
     args = parser.parse_args()
-    
-    # Check prerequisites
-    if not check_gsutil():
-        print("ERROR: gsutil not found!")
-        print("\nTo install gsutil:")
-        print("  1. Install Google Cloud SDK: https://cloud.google.com/sdk/docs/install")
-        print("  2. Authenticate: gcloud auth login")
-        print("  3. Configure: gcloud config set project YOUR_PROJECT_ID")
-        sys.exit(1)
-    
-    print("=" * 80)
-    print("ECG DATASET DOWNLOADER")
-    print("=" * 80)
-    print(f"\nTarget directory: {args.target_dir}")
-    print(f"Dataset(s): {args.dataset}")
-    
-    # Determine which datasets to download
-    if args.dataset == 'all':
-        datasets_to_download = list(DATASETS.keys())
+
+    # Pick backend
+    if _has_gsutil():
+        backend = 'gsutil'
+    elif _has_gcsfs():
+        backend = 'gcsfs'
     else:
-        datasets_to_download = [args.dataset]
-    
-    print(f"Datasets to process: {', '.join(datasets_to_download)}")
-    print(f"Force re-download: {args.force}")
-    
-    # Download each dataset
+        print("ERROR: Neither gsutil nor gcsfs is available.")
+        print("  Option A: pip install gcsfs")
+        print("  Option B: Install Google Cloud SDK (https://cloud.google.com/sdk/docs/install)")
+        sys.exit(1)
+
+    data_root = Path(args.target_dir).resolve()
+    data_root.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print("ECG DATASET DOWNLOADER")
+    print("=" * 70)
+    print(f"  Backend:    {backend}")
+    print(f"  Target dir: {data_root}")
+
+    datasets = list(DATASETS.keys()) if args.dataset == 'all' else [args.dataset]
     results = {}
-    for ds_name in datasets_to_download:
-        ds_info = DATASETS[ds_name]
-        local_path = Path(args.target_dir) / ds_name
-        
-        if args.force or not is_already_downloaded(local_path, ds_info['check_file']):
-            status = download_dataset(ds_name.upper(), ds_info['gcs'], local_path, ds_info['check_file'])
-            results[ds_name] = status if status != 'skipped' else True
-        else:
-            results[ds_name] = 'skipped'
-    
+    for name in datasets:
+        results[name] = download_dataset(name, DATASETS[name], data_root,
+                                         backend=backend, force=args.force)
+
     # Summary
-    print("\n" + "=" * 80)
-    print("Download Summary:")
-    print("=" * 80)
-    for ds_name, status in results.items():
-        if status == 'skipped':
-            print(f"  {ds_name.upper():<15} ✓ Already downloaded")
-        elif status:
-            print(f"  {ds_name.upper():<15} ✓ Downloaded successfully")
-        else:
-            print(f"  {ds_name.upper():<15} ✗ Download failed")
-    
-    success_count = sum(1 for s in results.values() if s in [True, 'skipped'])
-    print(f"\n{success_count}/{len(datasets_to_download)} datasets ready")
-    print("=" * 80)
-    
-    if success_count > 0:
-        print("\nEnvironment Variables (set these before running experiments):")
-        for ds_name in datasets_to_download:
-            local_path = Path(args.target_dir).absolute() / ds_name
-            env_var = f"{ds_name.upper()}_ROOT" if ds_name != 'mitbih' else 'MITDB_ROOT'
-            print(f'export {env_var}="{local_path}"')
-        
-        print("\nOr add to ~/.bashrc:")
-        for ds_name in datasets_to_download:
-            local_path = Path(args.target_dir).absolute() / ds_name
-            env_var = f"{ds_name.upper()}_ROOT" if ds_name != 'mitbih' else 'MITDB_ROOT'
-            print(f'echo \'export {env_var}="{local_path}"\' >> ~/.bashrc')
-        print("\nThen run experiments:")
-        print("  cd tinyml")
-        print("  python run_experiments.py --experiments ternary,synthesis,multi_scale")
+    print(f"\n{'=' * 70}")
+    print("SUMMARY")
+    print(f"{'=' * 70}")
+    for name, status in results.items():
+        info = DATASETS[name]
+        local = data_root / info['local_dir']
+        tag = {'skipped': 'PRESENT', True: 'OK', False: 'FAILED'}.get(status, '??')
+        print(f"  {name:<10} [{tag}]  {local}")
+
+    # Environment variable hints
+    ok = [n for n, s in results.items() if s in (True, 'skipped')]
+    if ok:
+        print(f"\nSet environment variables before running experiments:")
+        for name in ok:
+            info = DATASETS[name]
+            local = data_root / info['local_dir']
+            print(f'  export {info["env_var"]}="{local}"')
+        print(f'\n  # Or set the common root (data_loaders.py resolves sub-paths):')
+        print(f'  export TINYML_DATA_ROOT="{data_root}"')
+        print(f"\nThen run experiments:")
+        print(f"  cd tinyml && python run_experiments.py --experiments all")
 
 
 if __name__ == '__main__':

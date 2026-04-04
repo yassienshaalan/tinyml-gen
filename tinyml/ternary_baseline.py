@@ -50,6 +50,27 @@ def compute_ternary_scale(weights: torch.Tensor, ternary: torch.Tensor) -> float
         return (numerator / denominator).item()
 
 
+class TernaryQuantizer:
+    """
+    Standalone ternary quantizer for weight tensors.
+    Quantizes to {-1, 0, +1} with an optimal per-tensor scale factor.
+    """
+    def __init__(self, threshold: float = 0.7):
+        self.threshold = threshold
+
+    def quantize(self, weight: torch.Tensor):
+        """
+        Quantize a weight tensor to ternary values.
+
+        Returns:
+            quantized: Tensor with values in {-1, 0, +1}
+            scale: Scalar tensor (optimal reconstruction scale)
+        """
+        quantized = ternary_quantize_weights(weight, self.threshold)
+        scale_val = compute_ternary_scale(weight, quantized)
+        return quantized, torch.tensor(scale_val, dtype=weight.dtype)
+
+
 class TernaryConv1d(nn.Module):
     """
     Conv1d with ternary weights {-1, 0, +1}.
