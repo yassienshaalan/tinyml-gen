@@ -5,7 +5,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9+-red.svg)](https://pytorch.org/)
 
 Code for reproducing results from **"Once-for-All Channel Mixers (HYPERTINYPW): Generative Compression for TinyML"**  
-Accepted at **MLSys 2026** (Conference on Machine Learning and Systems)
+**Paper**: [arXiv:2603.24916](https://arxiv.org/abs/2603.24916) — final camera-ready to appear in **MLSys 2026**
 
 ---
 
@@ -15,15 +15,28 @@ Accepted at **MLSys 2026** (Conference on Machine Learning and Systems)
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Test your setup
+# 2. Download data + run all experiments (one command)
+cd scripts
+./run_all_experiments.sh
+
+# 3. Check results
+ls tinyml/results/
+```
+
+Or step-by-step:
+
+```bash
+# Download ECG datasets from GCP bucket (uses gcsfs or gsutil)
+python scripts/download_ecg_data.py --dataset all --target-dir ./data
+
+# Download Speech Commands v0.02 for keyword-spotting (~2 GB)
+python scripts/download_data.py --datasets speech --data-dir ./data
+
+# Set data paths and run
+export TINYML_DATA_ROOT=./data
+export SPEECH_COMMANDS_ROOT=./data/speech_commands_v0.02
 cd tinyml
-python test_experiments.py
-
-# 3. Run all experiments
-python run_experiments.py --experiments all
-
-# 4. Check results
-ls results/
+python run_experiments.py --experiments all --epochs 20
 ```
 
 All experiments log to files automatically.  
@@ -258,16 +271,22 @@ python test_experiments.py --quick
 ### Using Complete Pipeline Script
 
 ```bash
-# Run everything with one command
+# Run everything with one command (downloads data + runs all experiments)
 cd scripts
 ./run_all_experiments.sh
+
+# Or customize
+./run_all_experiments.sh --experiments ternary,synthesis --epochs 10
+./run_all_experiments.sh --skip-download --cpu          # data already local, CPU only
+./run_all_experiments.sh --help                         # see all options
 ```
 
 This script:
-1. Tests setup
-2. Runs all experiments
-3. Generates summary
-4. Shows results
+1. Downloads ECG data from GCP + Speech Commands via wget
+2. Sets environment variables
+3. Verifies setup (unit tests)
+4. Runs selected experiments
+5. Prints results summary
 
 ---
 
@@ -425,13 +444,15 @@ pip install -r requirements.txt
 #### 2. Dataset Not Found
 
 ```bash
-# Download datasets
-cd scripts
-./download_data.sh all
+# Download ECG datasets from GCP bucket
+python scripts/download_ecg_data.py --dataset all --target-dir ./data
 
-# Or set existing data paths
-export PTBXL_ROOT=/path/to/ptbxl
-export APNEA_ROOT=/path/to/apnea
+# Download Speech Commands for keyword spotting
+python scripts/download_data.py --datasets speech --data-dir ./data
+
+# Set data root (sub-paths resolved automatically)
+export TINYML_DATA_ROOT=./data
+export SPEECH_COMMANDS_ROOT=./data/speech_commands_v0.02
 ```
 
 #### 3. CUDA/GPU Issues
@@ -518,11 +539,14 @@ All tests should show `[OK]` for each component. If you see `[FAIL]`, check the 
 
 ## Citation
 
+**Preprint**: [arXiv:2603.24916](https://arxiv.org/abs/2603.24916)  
+**Camera-ready**: to appear in MLSys 2026
+
 ```bibtex
 @inproceedings{shaalan2026hypertinypw,
   title={Once-for-All Channel Mixers (HYPERTINYPW): Generative Compression for TinyML},
-  author={Shaalan, Yassien },
-  booktitle={Proceedings of MLSys26},
+  author={Shaalan, Yassien},
+  booktitle={Proceedings of MLSys 2026},
   year={2026}
 }
 ```
