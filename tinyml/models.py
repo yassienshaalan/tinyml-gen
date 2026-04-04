@@ -61,11 +61,23 @@ def register_alias(alias: str, target: str):
     MODEL_ALIASES[alias.lower()] = target.lower()
 
 
-def safe_build_model(model_name: str, in_ch: int, num_classes: int, **model_kwargs):
+def safe_build_model(model_name_or_cfg, in_ch: int = None, num_classes: int = None, **model_kwargs):
     """
     Resolve alias -> key, look up builder, and instantiate.
     Raises a clear error listing available names if not found.
+
+    Accepts either positional args ``(name, in_ch, num_classes, **kw)``
+    or a single config dict with at least a ``'name'`` key.
     """
+    if isinstance(model_name_or_cfg, dict):
+        cfg = dict(model_name_or_cfg)
+        model_name = cfg.pop('name')
+        in_ch = cfg.pop('in_channels', cfg.pop('in_ch', in_ch or 1))
+        num_classes = cfg.pop('num_classes', num_classes or 2)
+        model_kwargs.update(cfg)
+    else:
+        model_name = model_name_or_cfg
+
     key = MODEL_ALIASES.get(model_name.lower(), model_name.lower())
     if key not in MODEL_BUILDERS:
         avail = sorted(MODEL_BUILDERS.keys())
@@ -812,6 +824,27 @@ class FocalLoss(nn.Module):
 
 
 # ============================================================
+# ============================================================
+# HyperTinyPW — public API wrapper around SharedCoreSeparable1D
+# ============================================================
+
+class HyperTinyPW(SharedCoreSeparable1D):
+    """
+    Public-facing name for the HyperTiny pointwise-synthesis model.
+    Maps the documented constructor interface to SharedCoreSeparable1D.
+    """
+    def __init__(self, num_classes=2, in_channels=1, base_channels=16,
+                 num_blocks=4, latent_dim=16, seq_len=1800, **kwargs):
+        super().__init__(
+            in_ch=in_channels,
+            base=base_channels,
+            num_classes=num_classes,
+            latent_dim=latent_dim,
+            input_length=seq_len,
+            **kwargs,
+        )
+
+
 # Aliases for runner configs (IMPORTANT)
 # ============================================================
 

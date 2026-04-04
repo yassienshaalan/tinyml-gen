@@ -5,6 +5,12 @@ from typing import Dict, Tuple, Optional
 import torch
 from torch.utils.data import DataLoader
 
+# Re-export ApneaECGWindows so tests can do ``from datasets import ApneaECGWindows``
+try:
+    from data_loaders import ApneaECGWindows  # noqa: F401
+except ImportError:
+    pass
+
 # ---------------- Registry ----------------
 _DATASET_REGISTRY: Dict[str, callable] = {}
 _LOADER_CACHE: Dict[Tuple[str, int], tuple] = {}
@@ -135,3 +141,20 @@ def register_ptbxl(root: str):
 
 def register_mitdb(root: str):
     register_dataset("mitdb", lambda **kw: load_mitdb_loaders_impl(root=root, **kw))
+
+
+# ---------------- Synthetic data for smoke-tests ----------------
+def create_synthetic_ecg_data(n_samples: int, seq_len: int = 1800):
+    """
+    Generate synthetic binary-classification ECG-like data.
+
+    Returns:
+        X: Tensor of shape (n_samples, 1, seq_len)
+        y: Tensor of shape (n_samples,) with labels in {0, 1}
+    """
+    torch.manual_seed(42)
+    X = torch.randn(n_samples, 1, seq_len)
+    y = torch.randint(0, 2, (n_samples,))
+    # Make the two classes separable: class-1 signals get a positive shift
+    X[y == 1] += 1.0
+    return X, y

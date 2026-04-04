@@ -10189,7 +10189,8 @@ from data_loaders import (
 )
 
 def available_datasets() -> list:
-    return ["apnea_ecg","ptbxl","mitdb"]
+    base = ["apnea_ecg","ptbxl","mitdb"]
+    return list(dict.fromkeys(base + list(DATASET_REGISTRY.keys())))
 
 def make_loaders_from_legacy(ds_key: str, batch: int = 64, length: int = 1800, verbose: bool = True):
     if ds_key == "apnea_ecg":
