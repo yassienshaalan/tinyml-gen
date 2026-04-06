@@ -108,7 +108,7 @@ echo "[2/4] Setting environment variables..."
 export TINYML_DATA_ROOT="$DATA_DIR"
 export APNEA_ROOT="$DATA_DIR/apnea-ecg-database-1.0.0"
 export PTBXL_ROOT="$DATA_DIR/ptbxl"
-export MITDB_ROOT="$DATA_DIR/mitbih/raw"
+export MITDB_ROOT="$DATA_DIR/mitbih"
 export SPEECH_COMMANDS_ROOT="$DATA_DIR/speech_commands_v0.02"
 
 echo "  TINYML_DATA_ROOT   = $TINYML_DATA_ROOT"

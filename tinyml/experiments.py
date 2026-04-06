@@ -5978,10 +5978,10 @@ def _wfdb_download(db_name: str, dest: Path, do_download: bool, force: bool, ver
     if verbose: 
 	    print("  - Download completed.")
 
-DATA_BASE = _normalize_gs_uri(os.environ.get("TINYML_DATA_ROOT", "gs://store-pepper/tinyml_hyper_tiny_baselines/data"))
+DATA_BASE = _normalize_gs_uri(os.environ.get("TINYML_DATA_ROOT", "gs://hypertinypw"))
 APNEA_ROOT = _normalize_gs_uri(os.environ.get("APNEA_ROOT", f"{DATA_BASE}/apnea-ecg-database-1.0.0"))
 PTBXL_ROOT = _normalize_gs_uri(os.environ.get("PTBXL_ROOT", f"{DATA_BASE}/ptbxl"))
-MITDB_ROOT = _normalize_gs_uri(os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih/raw"))
+MITDB_ROOT = _normalize_gs_uri(os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih"))
 
 for p in [APNEA_ROOT, PTBXL_ROOT, MITDB_ROOT]:
     Path(p).mkdir(parents=True, exist_ok=True)
@@ -10220,7 +10220,7 @@ except Exception:
     gcsfs = None
 
 RUN_TS = os.environ.get("RUN_TS") or datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-RESULTS_BASE_GCS = "gs://store-pepper/tinyml_hyper_tiny_baselines/result" #os.environ.get("TINYML_RESULTS_GCS")  # e.g., 
+RESULTS_BASE_GCS = "gs://hypertinypw/results" #os.environ.get("TINYML_RESULTS_GCS")  # e.g.,
 
 def _gcsfs_handle():
     if gcsfs is None:

@@ -605,9 +605,14 @@ def run_ternary_baseline_comparison(args):
         
         # Train both models on synthetic data
         num_epochs = 10
-        hyper_test_acc, hyper_val_acc = train_and_evaluate(hyper_model, "HyperTinyPW", train_loader, val_loader, test_loader, num_epochs)
-        ternary_test_acc, ternary_val_acc = train_and_evaluate(ternary_model, "Ternary", train_loader, val_loader, test_loader, num_epochs)
-        
+        hyper_results = train_and_evaluate(hyper_model, "HyperTinyPW", train_loader, val_loader, test_loader, num_epochs)
+        ternary_results = train_and_evaluate(ternary_model, "Ternary", train_loader, val_loader, test_loader, num_epochs)
+
+        hyper_test_acc = hyper_results['test_acc']
+        hyper_val_acc = hyper_results['val_acc']
+        ternary_test_acc = ternary_results['test_acc']
+        ternary_val_acc = ternary_results['val_acc']
+
         # Show the trade-off
         print("\n" + "=" * 60)
         print("ACCURACY vs SIZE TRADE-OFF (SYNTHETIC DATA)")
@@ -617,14 +622,14 @@ def run_ternary_baseline_comparison(args):
         print(f"{'HyperTinyPW':<20} {hyper_kb:<12.2f} {hyper_test_acc:<12.2f} {hyper_val_acc:<12.2f}")
         print(f"{'Ternary (2-bit)':<20} {ternary_kb:<12.2f} {ternary_test_acc:<12.2f} {ternary_val_acc:<12.2f}")
         print("=" * 60)
-        
+
         acc_loss = hyper_test_acc - ternary_test_acc
         size_gain = ((hyper_kb - ternary_kb) / hyper_kb) * 100
-        
+
         print(f"\nTernary Trade-off:")
-        print(f"  ✓ Size: {abs(size_gain):.1f}% smaller ({ternary_kb:.2f} vs {hyper_kb:.2f} KB)")
-        print(f"  ✗ Accuracy: {acc_loss:.1f}% lower ({ternary_test_acc:.2f}% vs {hyper_test_acc:.2f}%)")
-        
+        print(f"  Size: {abs(size_gain):.1f}% smaller ({ternary_kb:.2f} vs {hyper_kb:.2f} KB)")
+        print(f"  Accuracy: {acc_loss:.1f}% lower ({ternary_test_acc:.2f}% vs {hyper_test_acc:.2f}%)")
+
         results = {
             'hypertiny_kb': float(hyper_kb),
             'hypertiny_test_acc': float(hyper_test_acc),
@@ -1006,9 +1011,26 @@ def run_8bit_quantization_baseline(args):
         print(f"Class weights: {class_weights.tolist()}")
         
     except Exception as e:
-        print(f"\nERROR: Could not load PTB-XL: {e}")
-        return None
-    
+        print(f"\nCould not load PTB-XL ({e}), using synthetic data...")
+        from torch.utils.data import TensorDataset
+        torch.manual_seed(42)
+        n_train, n_val, n_test = 500, 100, 100
+        train_x = torch.randn(n_train, 1, 1800)
+        train_y = torch.randint(0, 2, (n_train,))
+        train_x[train_y == 1] += 1.0
+        val_x = torch.randn(n_val, 1, 1800)
+        val_y = torch.randint(0, 2, (n_val,))
+        val_x[val_y == 1] += 1.0
+        test_x = torch.randn(n_test, 1, 1800)
+        test_y = torch.randint(0, 2, (n_test,))
+        test_x[test_y == 1] += 1.0
+        train_loader = torch.utils.data.DataLoader(TensorDataset(train_x, train_y), batch_size=32, shuffle=True)
+        val_loader = torch.utils.data.DataLoader(TensorDataset(val_x, val_y), batch_size=32)
+        test_loader = torch.utils.data.DataLoader(TensorDataset(test_x, test_y), batch_size=32)
+        class_counts = torch.tensor([float((train_y == 0).sum()), float((train_y == 1).sum())])
+        class_weights = 1.0 / (class_counts / class_counts.sum())
+        class_weights = class_weights / class_weights.sum() * 2
+
     # Training function
     def train_model(model, name, num_epochs=20):
         print(f"\n[Training {name}]")
@@ -1073,13 +1095,15 @@ def run_8bit_quantization_baseline(args):
     # Train FP32
     fp32_results = train_model(model_fp32, "FP32", 20)
     
-    # Apply INT8 quantization
+    # Apply INT8 quantization (only to classifier head, not the generator)
     print("\n" + "-" * 80)
     print("Applying INT8 dynamic quantization...")
-    model_int8 = torch.quantization.quantize_dynamic(
-        model_fp32.cpu(), {torch.nn.Conv1d, torch.nn.Linear}, dtype=torch.qint8
+    import copy
+    model_int8 = copy.deepcopy(model_fp32).cpu()
+    model_int8.head = torch.quantization.quantize_dynamic(
+        model_int8.head, {torch.nn.Linear}, dtype=torch.qint8
     )
-    print("✓ Quantized to INT8")
+    print("Quantized classifier head to INT8")
     
     # Evaluate INT8
     print("\nEvaluating INT8 model...")

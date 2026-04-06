@@ -93,12 +93,14 @@ tinyml-gen/
 │   ├── speech_dataset.py            # Audio dataset (KWS)
 │   ├── run_experiments.py           # Main experiment runner
 │   ├── test_experiments.py          # Comprehensive unit tests
+│   ├── test_data_readiness.py       # GCS access & experiment path tests
 │   └── main.py                      # Original experiments
 │
 ├── scripts/                         # Utility scripts
-│   ├── download_data.sh             # Download datasets
-│   ├── run_all_experiments.sh       # Full pipeline
-│   ├── download_ecg_data.py         # ECG downloader
+│   ├── download_data.sh             # Download all datasets
+│   ├── run_all_experiments.sh       # Full pipeline (download+run)
+│   ├── download_ecg_data.py         # ECG downloader (GCS→local)
+│   ├── smoke_test_all_paths.py      # Fast validation of all experiment paths
 │   └── fix_dependencies.sh          # Dependency fixer
 │
 ├── docs/                            # Documentation
@@ -109,7 +111,9 @@ tinyml-gen/
 ├── README.md                        # This file
 └── LICENSE                          # MIT License
 ```
-[Data on GCP Bucket](https://console.cloud.google.com/storage/browser/hypertinypw)
+**ECG Datasets**: hosted on a [public GCS bucket `gs://hypertinypw`](https://console.cloud.google.com/storage/browser/hypertinypw) (anonymous read access enabled).  
+Downloaded automatically by `scripts/download_ecg_data.py` via **gcsfs** (pure Python) or **gsutil**.
+
 ---
 
 ## Installation
@@ -157,6 +161,19 @@ python ../scripts/quick_test.py
 [OK] All modules imported successfully!
 [OK] Models can be instantiated
 [OK] Ready to run experiments
+```
+
+### Step 4: Verify Data Access & Experiment Paths
+
+```bash
+# Test GCS bucket access + all experiment paths (synthetic data, ~5 min)
+python ../scripts/smoke_test_all_paths.py
+
+# Test GCS permissions specifically
+python -m unittest test_data_readiness.TestGCSAccess -v
+
+# After downloading data, verify local data readiness
+python -m unittest test_data_readiness.TestLocalDataReadiness -v
 ```
 
 ---
