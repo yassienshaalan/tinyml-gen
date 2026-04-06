@@ -495,11 +495,11 @@ def run_ternary_baseline_comparison(args):
             
             # Train both models with comprehensive evaluation
             print(f"\n{'='*60}")
-            print(f"Training on {dataset_name} dataset (20 epochs with LR scheduling)")
+            print(f"Training on {dataset_name} dataset ({args.epochs} epochs with LR scheduling)")
             print(f"{'='*60}")
-            
-            hyper_results = train_and_evaluate(hyper_model, "HyperTinyPW", train_loader, val_loader, test_loader, num_epochs=20, class_weights=class_weights)
-            ternary_results = train_and_evaluate(ternary_model, "Ternary (2-bit)", train_loader, val_loader, test_loader, num_epochs=20, class_weights=class_weights)
+
+            hyper_results = train_and_evaluate(hyper_model, "HyperTinyPW", train_loader, val_loader, test_loader, num_epochs=args.epochs, class_weights=class_weights)
+            ternary_results = train_and_evaluate(ternary_model, "Ternary (2-bit)", train_loader, val_loader, test_loader, num_epochs=args.epochs, class_weights=class_weights)
             
             # Comprehensive comparison
             print("\n" + "=" * 80)
@@ -604,7 +604,7 @@ def run_ternary_baseline_comparison(args):
         print("Note: Data has clear pattern (mean shift +1.0) - expect 70-95% accuracy")
         
         # Train both models on synthetic data
-        num_epochs = 10
+        num_epochs = args.epochs
         hyper_results = train_and_evaluate(hyper_model, "HyperTinyPW", train_loader, val_loader, test_loader, num_epochs)
         ternary_results = train_and_evaluate(ternary_model, "Ternary", train_loader, val_loader, test_loader, num_epochs)
 
@@ -1093,7 +1093,7 @@ def run_8bit_quantization_baseline(args):
                 'best_epoch': best_epoch, 'per_class_acc': per_class_acc, 'confusion_matrix': conf_matrix}
     
     # Train FP32
-    fp32_results = train_model(model_fp32, "FP32", 20)
+    fp32_results = train_model(model_fp32, "FP32", args.epochs)
     
     # Apply INT8 quantization (only to classifier head, not the generator)
     print("\n" + "-" * 80)
@@ -1228,11 +1228,11 @@ def run_kws_perclass_analysis(args):
     model = model.to(device)
     
     # Quick training
-    print("Training (10 epochs for per-class analysis)...")
+    print(f"Training ({args.epochs} epochs for per-class analysis)...")
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     criterion = torch.nn.CrossEntropyLoss()
-    
-    for epoch in range(10):
+
+    for epoch in range(args.epochs):
         model.train()
         for batch_idx, (x, y) in enumerate(train_loader):
             x, y = x.to(device), y.to(device)
