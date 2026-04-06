@@ -42,24 +42,33 @@ RESET = "\033[0m"
 results = {}
 
 
+def _safe_print(*args, **kwargs):
+    """Print that recovers if sys.stdout was replaced by a closed TeeLogger."""
+    try:
+        print(*args, **kwargs)
+    except ValueError:
+        sys.stdout = sys.__stdout__
+        print(*args, **kwargs)
+
+
 def run_test(name, func):
-    print(f"\n{'=' * 60}")
-    print(f"  {name}")
-    print(f"{'=' * 60}")
+    _safe_print(f"\n{'=' * 60}")
+    _safe_print(f"  {name}")
+    _safe_print(f"{'=' * 60}")
     t0 = time.time()
     try:
         ret = func()
         elapsed = time.time() - t0
         tag = f"{GREEN}PASS{RESET}"
         results[name] = ("PASS", elapsed)
-        print(f"\n  [{tag}] {name} ({elapsed:.1f}s)")
+        _safe_print(f"\n  [{tag}] {name} ({elapsed:.1f}s)")
         return ret
     except Exception as e:
         elapsed = time.time() - t0
         tag = f"{RED}FAIL{RESET}"
         results[name] = ("FAIL", elapsed, str(e))
-        print(f"\n  [{tag}] {name}: {e}")
-        traceback.print_exc()
+        _safe_print(f"\n  [{tag}] {name}: {e}")
+        traceback.print_exc(file=sys.__stdout__)
         return None
 
 
@@ -77,10 +86,13 @@ def test_imports():
 def test_unit_tests():
     """Run the existing unittest suite."""
     import unittest
+    original_stdout = sys.__stdout__
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromName("test_experiments")
     runner = unittest.TextTestRunner(verbosity=0)
     result = runner.run(suite)
+    # Restore stdout in case TeeLogger hijacked it
+    sys.stdout = original_stdout
     if not result.wasSuccessful():
         fails = [str(f[0]) for f in result.failures + result.errors]
         raise RuntimeError(f"{len(fails)} test(s) failed: {fails}")
@@ -160,6 +172,9 @@ if __name__ == "__main__":
     run_test("8. Result files written", test_results_written)
 
     total = time.time() - t_start
+
+    # Ensure stdout is clean for summary
+    sys.stdout = sys.__stdout__
 
     # Summary
     print("\n" + "=" * 60)
