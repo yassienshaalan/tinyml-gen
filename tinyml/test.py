@@ -32,7 +32,7 @@ if ok == 0:
 import os
 from data_loaders import _list_trainable_records, load_apnea_ecg_loaders_impl
 
-os.environ["APNEA_ROOT"] = "gs://store-pepper/tinyml_hyper_tiny_baselines/data/apnea-ecg-database-1.0.0"
+os.environ["APNEA_ROOT"] = "gs://hypertinypw/apnea-ecg-database-1.0.0"
 root = os.environ["APNEA_ROOT"]
 
 recs = _list_trainable_records(root)

@@ -605,9 +605,14 @@ def run_ternary_baseline_comparison(args):
         
         # Train both models on synthetic data
         num_epochs = 10
-        hyper_test_acc, hyper_val_acc = train_and_evaluate(hyper_model, "HyperTinyPW", train_loader, val_loader, test_loader, num_epochs)
-        ternary_test_acc, ternary_val_acc = train_and_evaluate(ternary_model, "Ternary", train_loader, val_loader, test_loader, num_epochs)
-        
+        hyper_results = train_and_evaluate(hyper_model, "HyperTinyPW", train_loader, val_loader, test_loader, num_epochs)
+        ternary_results = train_and_evaluate(ternary_model, "Ternary", train_loader, val_loader, test_loader, num_epochs)
+
+        hyper_test_acc = hyper_results['test_acc']
+        hyper_val_acc = hyper_results['val_acc']
+        ternary_test_acc = ternary_results['test_acc']
+        ternary_val_acc = ternary_results['val_acc']
+
         # Show the trade-off
         print("\n" + "=" * 60)
         print("ACCURACY vs SIZE TRADE-OFF (SYNTHETIC DATA)")
@@ -617,14 +622,14 @@ def run_ternary_baseline_comparison(args):
         print(f"{'HyperTinyPW':<20} {hyper_kb:<12.2f} {hyper_test_acc:<12.2f} {hyper_val_acc:<12.2f}")
         print(f"{'Ternary (2-bit)':<20} {ternary_kb:<12.2f} {ternary_test_acc:<12.2f} {ternary_val_acc:<12.2f}")
         print("=" * 60)
-        
+
         acc_loss = hyper_test_acc - ternary_test_acc
         size_gain = ((hyper_kb - ternary_kb) / hyper_kb) * 100
-        
+
         print(f"\nTernary Trade-off:")
-        print(f"  ✓ Size: {abs(size_gain):.1f}% smaller ({ternary_kb:.2f} vs {hyper_kb:.2f} KB)")
-        print(f"  ✗ Accuracy: {acc_loss:.1f}% lower ({ternary_test_acc:.2f}% vs {hyper_test_acc:.2f}%)")
-        
+        print(f"  Size: {abs(size_gain):.1f}% smaller ({ternary_kb:.2f} vs {hyper_kb:.2f} KB)")
+        print(f"  Accuracy: {acc_loss:.1f}% lower ({ternary_test_acc:.2f}% vs {hyper_test_acc:.2f}%)")
+
         results = {
             'hypertiny_kb': float(hyper_kb),
             'hypertiny_test_acc': float(hyper_test_acc),

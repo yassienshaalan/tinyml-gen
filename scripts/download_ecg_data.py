@@ -17,10 +17,10 @@ import subprocess
 from pathlib import Path
 
 # ── GCP bucket layout ──────────────────────────────────────────────────────────
-GCP_BASE = "gs://store-pepper/tinyml_hyper_tiny_baselines/data"
+GCP_BASE = "gs://hypertinypw"
 
 # Maps dataset key → (GCS path, *local subdir*, check file).
-# Local subdirs now match what data_loaders.py expects by default.
+# Local subdirs match what data_loaders.py expects by default.
 DATASETS = {
     'apnea': {
         'gcs': f"{GCP_BASE}/apnea-ecg-database-1.0.0",
@@ -35,8 +35,8 @@ DATASETS = {
         'env_var': 'PTBXL_ROOT',
     },
     'mitbih': {
-        'gcs': f"{GCP_BASE}/mitbih/raw",
-        'local_dir': 'mitbih/raw',
+        'gcs': f"{GCP_BASE}/mitbih",
+        'local_dir': 'mitbih',
         'check_file': '100.dat',
         'env_var': 'MITDB_ROOT',
     },
@@ -67,9 +67,14 @@ def _download_gsutil(gcs_path, local_path):
 
 
 def _download_gcsfs(gcs_path, local_path):
-    """Download via gcsfs (pure-Python, no Cloud SDK needed)."""
+    """Download via gcsfs (pure-Python, no Cloud SDK needed). Uses anonymous access for public buckets."""
     import gcsfs
-    fs = gcsfs.GCSFileSystem()
+    # Try ADC first, fall back to anonymous for public buckets
+    try:
+        fs = gcsfs.GCSFileSystem()
+        fs.info(gcs_path.replace("gs://", "").split("/")[0])
+    except Exception:
+        fs = gcsfs.GCSFileSystem(token="anon")
     # Strip gs:// for gcsfs
     bucket_path = gcs_path.replace("gs://", "")
     remote_files = fs.find(bucket_path)

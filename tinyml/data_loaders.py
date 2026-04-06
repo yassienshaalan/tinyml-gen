@@ -39,8 +39,14 @@ def _normalize_gs_uri(uri: str) -> str:
 def _gcsfs():
     if gcsfs is None:
         raise ImportError("gcsfs is required for gs:// paths. Install with: pip install gcsfs")
-    # Uses Application Default Credentials on GCP VM
-    return gcsfs.GCSFileSystem(cache_timeout=60)
+    # Try ADC first; fall back to anonymous access for public buckets
+    try:
+        fs = gcsfs.GCSFileSystem(cache_timeout=60)
+        # Quick check — if ADC works, use it
+        fs.info("hypertinypw")
+        return fs
+    except Exception:
+        return gcsfs.GCSFileSystem(token="anon", cache_timeout=60)
 
 # Local cache for WFDB files fetched from GCS
 DATA_GCS_CACHE = Path(os.environ.get("DATA_GCS_CACHE", "/tmp/data_gcs_cache"))
@@ -127,10 +133,10 @@ def _record_base_paths(root: Union[str, Path], rid: str, needed_exts: List[str])
 # =============================
 # Config (env-overridable)
 # =============================
-DATA_BASE = _normalize_gs_uri(os.environ.get("TINYML_DATA_ROOT", "gs://store-pepper/tinyml_hyper_tiny_baselines/data"))
+DATA_BASE = _normalize_gs_uri(os.environ.get("TINYML_DATA_ROOT", "gs://hypertinypw"))
 APNEA_ROOT = _normalize_gs_uri(os.environ.get("APNEA_ROOT", f"{DATA_BASE}/apnea-ecg-database-1.0.0"))
 PTBXL_ROOT = _normalize_gs_uri(os.environ.get("PTBXL_ROOT", f"{DATA_BASE}/ptbxl"))
-MITDB_ROOT = _normalize_gs_uri(os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih/raw"))
+MITDB_ROOT = _normalize_gs_uri(os.environ.get("MITDB_ROOT", f"{DATA_BASE}/mitbih"))
 
 FS = 100  # Apnea-ECG sampling rate
 
